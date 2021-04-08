@@ -1,0 +1,19 @@
+trigger:
+- master
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: apt-get -y install build-essential cmake ncurses-dev libncurses5-dev libpcre2-dev gettext 
+  displayName: 'Setup'
+
+- script: |
+    mkdir build && cd build
+    cmake ..
+    make
+  displayName: 'Build'
+
+- script: |
+    make install
+  displayName: 'Install'
