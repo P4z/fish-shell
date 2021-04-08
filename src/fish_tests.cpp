@@ -195,6 +195,16 @@ static void popd() {
     env_stack_t::principal().set_pwd_from_getcwd();
 }
 
+// Helper to return a string whose length greatly exceeds PATH_MAX.
+wcstring get_overlong_path() {
+    wcstring longpath;
+    longpath.reserve(PATH_MAX * 2 + 10);
+    while (longpath.size() <= PATH_MAX * 2) {
+        longpath += L"/overlong";
+    }
+    return longpath;
+}
+
 // The odd formulation of these macros is to avoid "multiple unary operator" warnings from oclint
 // were we to use the more natural "if (!(e)) err(..." form. We have to do this because the rules
 // for the C preprocessor make it practically impossible to embed a comment in the body of a macro.
@@ -548,6 +558,32 @@ static void test_convert_ascii() {
     }
 }
 
+/// fish uses the private-use range to encode bytes that could not be decoded using the user's locale.
+/// If the input could be decoded, but decoded to private-use codepoints, then fish should also use the direct encoding for those bytes.
+/// Verify that characters in the private use area are correctly round-tripped.
+/// See #7723.
+static void test_convert_private_use() {
+    for (wchar_t wc = ENCODE_DIRECT_BASE; wc < ENCODE_DIRECT_END; wc++) {
+        // Encode the char via the locale. Do not use fish functions which interpret these specially.
+        char converted[MB_LEN_MAX];
+        mbstate_t state{};
+        size_t len = std::wcrtomb(converted, wc, &state);
+        if (len == static_cast<size_t>(-1)) {
+            // Could not be encoded in this locale.
+            continue;
+        }
+        std::string s(converted, len);
+
+        // Ask fish to decode this via str2wcstring.
+        // str2wcstring should notice that the decoded form collides with its private use and encode it directly.
+        wcstring ws = str2wcstring(s);
+
+        // Each byte should be encoded directly, and round tripping should work.
+        do_test(ws.size() == s.size());
+        do_test(wcs2string(ws) == s);
+    }
+}
+
 static void perf_convert_ascii() {
     std::string s(128 * 1024, '\0');
     for (size_t i = 0; i < s.size(); i++) {
@@ -787,23 +823,31 @@ static void test_fd_monitor() {
     struct item_maker_t {
         std::atomic<bool> did_timeout{false};
         std::atomic<size_t> length_read{0};
+        std::atomic<size_t> pokes{0};
         std::atomic<size_t> total_calls{0};
+        fd_monitor_item_id_t item_id{0};
         bool always_exit{false};
         fd_monitor_item_t item;
         autoclose_fd_t writer;
 
         explicit item_maker_t(uint64_t timeout_usec) {
-            auto pipes = make_autoclose_pipes({}).acquire();
+            auto pipes = make_autoclose_pipes().acquire();
             writer = std::move(pipes.write);
-            auto callback = [this](autoclose_fd_t &fd, bool timed_out) {
+            auto callback = [this](autoclose_fd_t &fd, item_wake_reason_t reason) {
                 bool was_closed = false;
-                if (timed_out) {
-                    this->did_timeout = true;
-                } else {
-                    char buff[4096];
-                    ssize_t amt = read(fd.fd(), buff, sizeof buff);
-                    length_read += amt;
-                    was_closed = (amt == 0);
+                switch (reason) {
+                    case item_wake_reason_t::timeout:
+                        this->did_timeout = true;
+                        break;
+                    case item_wake_reason_t::poke:
+                        this->pokes += 1;
+                        break;
+                    case item_wake_reason_t::readable:
+                        char buff[4096];
+                        ssize_t amt = read(fd.fd(), buff, sizeof buff);
+                        this->length_read += amt;
+                        was_closed = (amt == 0);
+                        break;
                 }
                 total_calls += 1;
                 if (always_exit || was_closed) {
@@ -816,7 +860,7 @@ static void test_fd_monitor() {
         item_maker_t(const item_maker_t &) = delete;
 
         // Write 42 bytes to our write end.
-        void write42() {
+        void write42() const {
             char buff[42] = {0};
             (void)write_loop(writer.fd(), buff, sizeof buff);
         }
@@ -826,7 +870,7 @@ static void test_fd_monitor() {
 
     // Items which will never receive data or be called back.
     item_maker_t item_never(fd_monitor_item_t::kNoTimeout);
-    item_maker_t item_hugetimeout(100000000llu * usec_per_msec);
+    item_maker_t item_hugetimeout(100000000LLU * usec_per_msec);
 
     // Item which should get no data, and time out.
     item_maker_t item0_timeout(16 * usec_per_msec);
@@ -840,45 +884,70 @@ static void test_fd_monitor() {
     // Item which should get 42 bytes, then get notified it is closed.
     item_maker_t item42_thenclose(16 * usec_per_msec);
 
+    // Item which gets one poke.
+    item_maker_t item_pokee(fd_monitor_item_t::kNoTimeout);
+
     // Item which should be called back once.
     item_maker_t item_oneshot(16 * usec_per_msec);
     item_oneshot.always_exit = true;
+
     {
         fd_monitor_t monitor;
-        for (auto item : {&item_never, &item_hugetimeout, &item0_timeout, &item42_timeout,
-                          &item42_nottimeout, &item42_thenclose, &item_oneshot}) {
-            monitor.add(std::move(item->item));
+        for (item_maker_t *item :
+             {&item_never, &item_hugetimeout, &item0_timeout, &item42_timeout, &item42_nottimeout,
+              &item42_thenclose, &item_pokee, &item_oneshot}) {
+            item->item_id = monitor.add(std::move(item->item));
         }
         item42_timeout.write42();
         item42_nottimeout.write42();
         item42_thenclose.write42();
         item42_thenclose.writer.close();
         item_oneshot.write42();
-        std::this_thread::sleep_for(std::chrono::milliseconds(84));
+        monitor.poke_item(item_pokee.item_id);
+
+        // May need to loop here to ensure our fd_monitor gets scheduled - see #7699.
+        for (int i = 0; i < 100; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(84));
+            if (item0_timeout.did_timeout) {
+                break;
+            }
+        }
     }
 
     do_test(!item_never.did_timeout);
     do_test(item_never.length_read == 0);
+    do_test(item_never.pokes == 0);
 
     do_test(!item_hugetimeout.did_timeout);
     do_test(item_hugetimeout.length_read == 0);
+    do_test(item_hugetimeout.pokes == 0);
 
     do_test(item0_timeout.length_read == 0);
     do_test(item0_timeout.did_timeout);
+    do_test(item0_timeout.pokes == 0);
 
     do_test(item42_timeout.length_read == 42);
     do_test(item42_timeout.did_timeout);
+    do_test(item42_timeout.pokes == 0);
 
     do_test(item42_nottimeout.length_read == 42);
     do_test(!item42_nottimeout.did_timeout);
+    do_test(item42_nottimeout.pokes == 0);
 
     do_test(item42_thenclose.did_timeout == false);
     do_test(item42_thenclose.length_read == 42);
     do_test(item42_thenclose.total_calls == 2);
+    do_test(item42_thenclose.pokes == 0);
 
     do_test(!item_oneshot.did_timeout);
     do_test(item_oneshot.length_read == 42);
     do_test(item_oneshot.total_calls == 1);
+    do_test(item_oneshot.pokes == 0);
+
+    do_test(!item_pokee.did_timeout);
+    do_test(item_pokee.length_read == 0);
+    do_test(item_pokee.total_calls == 1);
+    do_test(item_pokee.pokes == 1);
 }
 
 static void test_iothread() {
@@ -945,7 +1014,7 @@ static void test_debounce() {
 
     // Wait until the last completion is done.
     while (!completion_ran.back()) {
-        iothread_service_completion();
+        iothread_service_main();
     }
     iothread_drain_all();
 
@@ -1267,19 +1336,19 @@ static void test_parser() {
 }
 
 static void test_1_cancellation(const wchar_t *src) {
-    auto filler = io_bufferfill_t::create(fd_set_t{});
+    auto filler = io_bufferfill_t::create();
     pthread_t thread = pthread_self();
-    double delay = 0.25 /* seconds */;
+    double delay = 0.50 /* seconds */;
     iothread_perform([=]() {
         /// Wait a while and then SIGINT the main thread.
         usleep(delay * 1E6);
         pthread_kill(thread, SIGINT);
     });
     eval_res_t res = parser_t::principal_parser().eval(src, io_chain_t{filler});
-    auto buffer = io_bufferfill_t::finish(std::move(filler));
-    if (buffer->buffer().size() != 0) {
+    separated_buffer_t buffer = io_bufferfill_t::finish(std::move(filler));
+    if (buffer.size() != 0) {
         err(L"Expected 0 bytes in out_buff, but instead found %lu bytes, for command %ls\n",
-            buffer->buffer().size(), src);
+            buffer.size(), src);
     }
     do_test(res.status.signal_exited() && res.status.signal_code() == SIGINT);
     iothread_drain_all();
@@ -1356,7 +1425,7 @@ static void test_indents() {
     add_test(&tests,                //
              0, "if", 1, " foo",    //
              1, "\nif", 2, " bar",  //
-             1, "\n",  // FIXME: this should be 2 but parse_util_compute_indents has a bug
+             2, "\n",               //
              1, "\nend\n");
 
     add_test(&tests,                //
@@ -1410,6 +1479,70 @@ static void test_indents() {
              1, "\n# comment",         // comment indentation handling
              1, "\ncommand",           //
              1, "\n# comment 2"        //
+    );
+
+    add_test(&tests,      //
+             0, "begin",  //
+             1, "\n",     // "begin" is special because this newline belongs to the block header
+             1, "\n"      //
+    );
+
+    // Continuation lines.
+    add_test(&tests,                            //
+             0, "echo 'continuation line' \\",  //
+             1, "\ncont",                       //
+             0, "\n"                            //
+    );
+    add_test(&tests,                                  //
+             0, "echo 'empty continuation line' \\",  //
+             1, "\n"                                  //
+    );
+    add_test(&tests,                                   //
+             0, "begin # continuation line in block",  //
+             1, "\necho \\",                           //
+             2, "\ncont"                               //
+    );
+    add_test(&tests,                                         //
+             0, "begin # empty continuation line in block",  //
+             1, "\necho \\",                                 //
+             2, "\n",                                        //
+             0, "\nend"                                      //
+    );
+    add_test(&tests,                                      //
+             0, "echo 'multiple continuation lines' \\",  //
+             1, "\nline1 \\",                             //
+             1, "\n# comment",                            //
+             1, "\n# more comment",                       //
+             1, "\nline2 \\",                             //
+             1, "\n"                                      //
+    );
+    add_test(&tests,                                   //
+             0, "echo # inline comment ending in \\",  //
+             0, "\nline"                               //
+    );
+    add_test(&tests,                            //
+             0, "# line comment ending in \\",  //
+             0, "\nline"                        //
+    );
+    add_test(&tests,                                            //
+             0, "echo 'multiple empty continuation lines' \\",  //
+             1, "\n\\",                                         //
+             1, "\n",                                           //
+             0, "\n"                                            //
+    );
+    add_test(&tests,                                                      //
+             0, "echo 'multiple statements with continuation lines' \\",  //
+             1, "\nline 1",                                               //
+             0, "\necho \\",                                              //
+             1, "\n"                                                      //
+    );
+    // This is an edge case, probably okay to change the behavior here.
+    add_test(&tests,                                              //
+             0, "begin", 1, " \\",                                //
+             2, "\necho 'continuation line in block header' \\",  //
+             2, "\n",                                             //
+             1, "\n",                                             //
+             0, "\nend"                                           //
     );
 
     int test_idx = 0;
@@ -1471,12 +1604,12 @@ static void test_parse_util_cmdsubst_extent() {
     }
 
     parse_util_cmdsubst_extent(a, 8, &begin, &end);
-    if (begin != a + std::wcslen(L"echo (")) {
+    if (begin != a + const_strlen(L"echo (")) {
         err(L"parse_util_cmdsubst_extent failed on line %ld", (long)__LINE__);
     }
 
     parse_util_cmdsubst_extent(a, 17, &begin, &end);
-    if (begin != a + std::wcslen(L"echo (echo (")) {
+    if (begin != a + const_strlen(L"echo (echo (")) {
         err(L"parse_util_cmdsubst_extent failed on line %ld", (long)__LINE__);
     }
 }
@@ -1616,7 +1749,8 @@ static void test_wchar2utf8(const wchar_t *src, size_t slen, const char *dst, si
 #endif
 
     if (dst) {
-        mem = (char *)malloc(dlen);
+        // We want to pass a valid pointer to wchar_to_utf8, so allocate at least one byte.
+        mem = (char *)malloc(dlen + 1);
         if (!mem) {
             err(L"w2u: %s: MALLOC FAILED", descr);
             return;
@@ -1784,7 +1918,7 @@ static void test_escape_sequences() {
         err(L"test_escape_sequences failed on line %d\n", __LINE__);
     if (lc.escape_code_length(L"\x1B[2J") != 4)
         err(L"test_escape_sequences failed on line %d\n", __LINE__);
-    if (lc.escape_code_length(L"\x1B[38;5;123mABC") != std::strlen("\x1B[38;5;123m"))
+    if (lc.escape_code_length(L"\x1B[38;5;123mABC") != strlen("\x1B[38;5;123m"))
         err(L"test_escape_sequences failed on line %d\n", __LINE__);
     if (lc.escape_code_length(L"\x1B@") != 2)
         err(L"test_escape_sequences failed on line %d\n", __LINE__);
@@ -1883,26 +2017,47 @@ static void test_lru() {
     do_test(cache.evicted.size() == size_t(total_nodes));
 }
 
-/// A crappy environment_t that only knows about PWD.
-struct pwd_environment_t : public environment_t {
-    std::map<wcstring, wcstring> extras;
+/// An environment built around an std::map.
+struct test_environment_t : public environment_t {
+    std::map<wcstring, wcstring> vars;
 
     virtual maybe_t<env_var_t> get(const wcstring &key,
                                    env_mode_flags_t mode = ENV_DEFAULT) const override {
         UNUSED(mode);
-        if (key == L"PWD") {
-            return env_var_t{wgetcwd(), 0};
+        auto iter = vars.find(key);
+        if (iter != vars.end()) {
+            return env_var_t(iter->second, ENV_DEFAULT);
         }
-        auto extra = extras.find(key);
-        if (extra != extras.end()) {
-            return env_var_t(extra->second, ENV_DEFAULT);
-        }
-        return {};
+        return none();
     }
 
     wcstring_list_t get_names(int flags) const override {
         UNUSED(flags);
-        return {L"PWD"};
+        wcstring_list_t result;
+        for (const auto &kv : vars) {
+            result.push_back(kv.first);
+        }
+        return result;
+    }
+};
+
+/// A test environment that knows about PWD.
+struct pwd_environment_t : public test_environment_t {
+    virtual maybe_t<env_var_t> get(const wcstring &key,
+                                   env_mode_flags_t mode = ENV_DEFAULT) const override {
+        if (key == L"PWD") {
+            return env_var_t{wgetcwd(), 0};
+        }
+        return test_environment_t::get(key, mode);
+    }
+
+    wcstring_list_t get_names(int flags) const override {
+        auto res = test_environment_t::get_names(flags);
+        res.clear();
+        if (std::count(res.begin(), res.end(), L"PWD") == 0) {
+            res.push_back(L"PWD");
+        }
+        return res;
     }
 };
 
@@ -2237,41 +2392,41 @@ static void test_abbreviations() {
     result = expand_abbreviation_in_command(L"gc somebranch", 0, vars);
     if (!result) err(L"Command not expanded on line %ld", (long)__LINE__);
 
-    result = expand_abbreviation_in_command(L"gc somebranch", std::wcslen(L"gc"), vars);
+    result = expand_abbreviation_in_command(L"gc somebranch", const_strlen(L"gc"), vars);
     if (!result) err(L"gc not expanded");
     if (result != L"git checkout somebranch")
         err(L"gc incorrectly expanded on line %ld to '%ls'", (long)__LINE__, result->c_str());
 
     // Space separation.
-    result = expand_abbreviation_in_command(L"gx somebranch", std::wcslen(L"gc"), vars);
+    result = expand_abbreviation_in_command(L"gx somebranch", const_strlen(L"gc"), vars);
     if (!result) err(L"gx not expanded");
     if (result != L"git checkout somebranch")
         err(L"gc incorrectly expanded on line %ld to '%ls'", (long)__LINE__, result->c_str());
 
-    result = expand_abbreviation_in_command(L"echo hi ; gc somebranch", std::wcslen(L"echo hi ; g"),
-                                            vars);
+    result = expand_abbreviation_in_command(L"echo hi ; gc somebranch",
+                                            const_strlen(L"echo hi ; g"), vars);
     if (!result) err(L"gc not expanded on line %ld", (long)__LINE__);
     if (result != L"echo hi ; git checkout somebranch")
         err(L"gc incorrectly expanded on line %ld", (long)__LINE__);
 
     result = expand_abbreviation_in_command(L"echo (echo (echo (echo (gc ",
-                                            std::wcslen(L"echo (echo (echo (echo (gc"), vars);
+                                            const_strlen(L"echo (echo (echo (echo (gc"), vars);
     if (!result) err(L"gc not expanded on line %ld", (long)__LINE__);
     if (result != L"echo (echo (echo (echo (git checkout ")
         err(L"gc incorrectly expanded on line %ld to '%ls'", (long)__LINE__, result->c_str());
 
     // If commands should be expanded.
-    result = expand_abbreviation_in_command(L"if gc", std::wcslen(L"if gc"), vars);
+    result = expand_abbreviation_in_command(L"if gc", const_strlen(L"if gc"), vars);
     if (!result) err(L"gc not expanded on line %ld", (long)__LINE__);
     if (result != L"if git checkout")
         err(L"gc incorrectly expanded on line %ld to '%ls'", (long)__LINE__, result->c_str());
 
     // Others should not be.
-    result = expand_abbreviation_in_command(L"of gc", std::wcslen(L"of gc"), vars);
+    result = expand_abbreviation_in_command(L"of gc", const_strlen(L"of gc"), vars);
     if (result) err(L"gc incorrectly expanded on line %ld", (long)__LINE__);
 
     // Others should not be.
-    result = expand_abbreviation_in_command(L"command gc", std::wcslen(L"command gc"), vars);
+    result = expand_abbreviation_in_command(L"command gc", const_strlen(L"command gc"), vars);
     if (result) err(L"gc incorrectly expanded on line %ld", (long)__LINE__);
 
     vars.pop();
@@ -2424,7 +2579,7 @@ struct pager_layout_testcase_t {
                 text.push_back(p.character);
             }
             if (text != expected) {
-                std::fwprintf(stderr, L"width %zu got %zu<%ls>, expected %zu<%ls>\n", this->width,
+                std::fwprintf(stderr, L"width %d got %zu<%ls>, expected %zu<%ls>\n", this->width,
                               text.length(), text.c_str(), expected.length(), expected.c_str());
                 for (size_t i = 0; i < std::max(text.length(), expected.length()); i++) {
                     std::fwprintf(stderr, L"i %zu got <%lx> expected <%lx>\n", i,
@@ -2561,10 +2716,15 @@ static void test_word_motion() {
     test_1_word_motion(word_motion_left, move_word_style_path_components, L"^/^foo/^bar/^baz/^");
     test_1_word_motion(word_motion_left, move_word_style_path_components, L"^echo ^--foo ^--bar^");
     test_1_word_motion(word_motion_left, move_word_style_path_components,
-                       L"^echo ^hi ^> /^dev/^null^");
+                       L"^echo ^hi ^> ^/^dev/^null^");
 
     test_1_word_motion(word_motion_left, move_word_style_path_components,
-                       L"^echo /^foo/^bar{^aaa,^bbb,^ccc}^bak/^");
+                       L"^echo ^/^foo/^bar{^aaa,^bbb,^ccc}^bak/^");
+    test_1_word_motion(word_motion_left, move_word_style_path_components, L"^echo ^bak ^///^");
+    test_1_word_motion(word_motion_left, move_word_style_path_components, L"^aaa ^@ ^@^aaa^");
+    test_1_word_motion(word_motion_left, move_word_style_path_components, L"^aaa ^a ^@^aaa^");
+    test_1_word_motion(word_motion_left, move_word_style_path_components, L"^aaa ^@@@ ^@@^aa^");
+    test_1_word_motion(word_motion_left, move_word_style_path_components, L"^aa^@@  ^aa@@^a^");
 
     test_1_word_motion(word_motion_right, move_word_style_punctuation, L"^a^ bcd^");
     test_1_word_motion(word_motion_right, move_word_style_punctuation, L"a^b^ cde^");
@@ -2613,31 +2773,24 @@ static void test_is_potential_path() {
 }
 
 /// Test the 'test' builtin.
-maybe_t<int> builtin_test(parser_t &parser, io_streams_t &streams, wchar_t **argv);
-static bool run_one_test_test(int expected, wcstring_list_t &lst, bool bracket) {
+maybe_t<int> builtin_test(parser_t &parser, io_streams_t &streams, const wchar_t **argv);
+static bool run_one_test_test(int expected, const wcstring_list_t &lst, bool bracket) {
     parser_t &parser = parser_t::principal_parser();
-    size_t i, count = lst.size();
-    wchar_t **argv = new wchar_t *[count + 3];
-    argv[0] = (wchar_t *)(bracket ? L"[" : L"test");
-    for (i = 0; i < count; i++) {
-        argv[i + 1] = (wchar_t *)lst.at(i).c_str();
-    }
-    if (bracket) {
-        argv[i + 1] = (wchar_t *)L"]";
-        i++;
-    }
-    argv[i + 1] = NULL;
+    wcstring_list_t argv;
+    argv.push_back(bracket ? L"[" : L"test");
+    argv.insert(argv.end(), lst.begin(), lst.end());
+    if (bracket) argv.push_back(L"]");
+
+    null_terminated_array_t<wchar_t> cargv(argv);
+
     null_output_stream_t null{};
     io_streams_t streams(null, null);
-    maybe_t<int> result = builtin_test(parser, streams, argv);
+    maybe_t<int> result = builtin_test(parser, streams, cargv.get());
 
     if (result != expected) {
         std::wstring got = result ? std::to_wstring(result.value()) : L"nothing";
         err(L"expected builtin_test() to return %d, got %s", expected, got.c_str());
     }
-
-    delete[] argv;
-
     return result == expected;
 }
 
@@ -2666,16 +2819,16 @@ static void test_test_brackets() {
     null_output_stream_t null{};
     io_streams_t streams(null, null);
 
-    null_terminated_array_t<wchar_t> args;
+    wcstring_list_t args;
 
-    args.set({L"[", L"foo"});
-    do_test(builtin_test(parser, streams, args.get()) != 0);
+    const wchar_t *args1[] = {L"[", L"foo", nullptr};
+    do_test(builtin_test(parser, streams, args1) != 0);
 
-    args.set({L"[", L"foo", L"]"});
-    do_test(builtin_test(parser, streams, args.get()) == 0);
+    const wchar_t *args2[] = {L"[", L"foo", L"]", nullptr};
+    do_test(builtin_test(parser, streams, args2) == 0);
 
-    args.set({L"[", L"foo", L"]", L"bar"});
-    do_test(builtin_test(parser, streams, args.get()) != 0);
+    const wchar_t *args3[] = {L"[", L"foo", L"]", L"bar", nullptr};
+    do_test(builtin_test(parser, streams, args3) != 0);
 }
 
 static void test_test() {
@@ -2997,9 +3150,14 @@ static void test_complete() {
     if (system("mkdir -p 'test/complete_test'")) err(L"mkdir failed");
     if (system("touch 'test/complete_test/has space'")) err(L"touch failed");
     if (system("touch 'test/complete_test/bracket[abc]'")) err(L"touch failed");
+#ifndef __CYGWIN__ // Square brackets are not legal path characters on WIN32/CYGWIN
     if (system(R"(touch 'test/complete_test/gnarlybracket\[abc]')")) err(L"touch failed");
+#endif
     if (system("touch 'test/complete_test/testfile'")) err(L"touch failed");
     if (system("chmod 700 'test/complete_test/testfile'")) err(L"chmod failed");
+    if (system("mkdir -p 'test/complete_test/foo1'")) err(L"mkdir failed");
+    if (system("mkdir -p 'test/complete_test/foo2'")) err(L"mkdir failed");
+    if (system("mkdir -p 'test/complete_test/foo3'")) err(L"mkdir failed");
 
     completions = do_complete(L"echo (test/complete_test/testfil", {});
     do_test(completions.size() == 1);
@@ -3032,6 +3190,7 @@ static void test_complete() {
         completions.front().completion, completions.front().flags, cmdline, &where, false);
     do_test(newcmdline == L"touch test/complete_test/bracket\\[abc\\] ");
 
+#ifndef __CYGWIN__ // Square brackets are not legal path characters on WIN32/CYGWIN
     cmdline = LR"(touch test/complete_test/gnarlybracket\\[)";
     completions = do_complete(cmdline, {});
     do_test(completions.size() == 1);
@@ -3040,6 +3199,7 @@ static void test_complete() {
     newcmdline = completion_apply_to_command_line(
         completions.front().completion, completions.front().flags, cmdline, &where, false);
     do_test(newcmdline == LR"(touch test/complete_test/gnarlybracket\\\[abc\] )");
+#endif
 
     // Add a function and test completing it in various ways.
     // Note we're depending on function_add not complaining when given missing parsed_source /
@@ -3160,6 +3320,36 @@ static void test_complete() {
     do_test(comma_join(complete_get_wrap_targets(L"wrapper1")).empty());
     do_test(comma_join(complete_get_wrap_targets(L"wrapper2")) == L"wrapper3");
     do_test(comma_join(complete_get_wrap_targets(L"wrapper3")) == L"wrapper1");
+
+    // Test cd wrapping chain
+    if (!pushd("test/complete_test")) err(L"pushd(\"test/complete_test\") failed");
+
+    complete_add_wrapper(L"cdwrap1", L"cd");
+    complete_add_wrapper(L"cdwrap2", L"cdwrap1");
+
+    completion_list_t cd_compl = do_complete(L"cd ", {});
+    completions_sort_and_prioritize(&cd_compl);
+
+    completion_list_t cdwrap1_compl = do_complete(L"cdwrap1 ", {});
+    completions_sort_and_prioritize(&cdwrap1_compl);
+
+    completion_list_t cdwrap2_compl = do_complete(L"cdwrap2 ", {});
+    completions_sort_and_prioritize(&cdwrap2_compl);
+
+    size_t min_compl_size =
+        std::min(cd_compl.size(), std::min(cdwrap1_compl.size(), cdwrap2_compl.size()));
+
+    do_test(cd_compl.size() == min_compl_size);
+    do_test(cdwrap1_compl.size() == min_compl_size);
+    do_test(cdwrap2_compl.size() == min_compl_size);
+    for (size_t i = 0; i < min_compl_size; ++i) {
+        do_test(cd_compl[i].completion == cdwrap1_compl[i].completion);
+        do_test(cdwrap1_compl[i].completion == cdwrap2_compl[i].completion);
+    }
+
+    complete_remove_wrapper(L"cdwrap1", L"cd");
+    complete_remove_wrapper(L"cdwrap2", L"cdwrap1");
+    popd();
 }
 
 static void test_1_completion(wcstring line, const wcstring &completion, complete_flags_t flags,
@@ -3322,7 +3512,7 @@ static void test_autosuggest_suggest_special() {
     const wcstring wd = L"test/autosuggest_test";
 
     pwd_environment_t vars{};
-    vars.extras[L"HOME"] = parser_t::principal_parser().vars().get(L"HOME")->as_string();
+    vars.vars[L"HOME"] = parser_t::principal_parser().vars().get(L"HOME")->as_string();
 
     perform_one_autosuggestion_cd_test(L"cd test/autosuggest_test/0", L"foobar/", vars, __LINE__);
     perform_one_autosuggestion_cd_test(L"cd \"test/autosuggest_test/0", L"foobar/", vars, __LINE__);
@@ -3351,7 +3541,7 @@ static void test_autosuggest_suggest_special() {
     perform_one_autosuggestion_cd_test(L"cd 'test/autosuggest_test/5", L"foo\"bar/", vars,
                                        __LINE__);
 
-    vars.extras[L"AUTOSUGGEST_TEST_LOC"] = wd;
+    vars.vars[L"AUTOSUGGEST_TEST_LOC"] = wd;
     perform_one_autosuggestion_cd_test(L"cd $AUTOSUGGEST_TEST_LOC/0", L"foobar/", vars, __LINE__);
     perform_one_autosuggestion_cd_test(L"cd ~/test_autosuggest_suggest_specia", L"l/", vars,
                                        __LINE__);
@@ -3460,7 +3650,7 @@ static bool history_contains(history_t *history, const wcstring &txt) {
     return result;
 }
 
-static bool history_contains(const std::unique_ptr<history_t> &history, const wcstring &txt) {
+static bool history_contains(const std::shared_ptr<history_t> &history, const wcstring &txt) {
     return history_contains(history.get(), txt);
 }
 
@@ -3491,21 +3681,6 @@ static void test_input() {
     } else if (evt.get_readline() != readline_cmd_t::down_line) {
         err(L"Expected to read char down_line");
     }
-}
-
-static void test_fd_set() {
-    say(L"Testing fd_set");
-    fd_set_t fds;
-    do_test(!fds.contains(0));
-    do_test(!fds.contains(100));
-    fds.add(1);
-    do_test(!fds.contains(0));
-    do_test(!fds.contains(100));
-    do_test(fds.contains(1));
-    fds.add(1);
-    do_test(!fds.contains(0));
-    do_test(!fds.contains(100));
-    do_test(fds.contains(1));
 }
 
 static void test_line_iterator() {
@@ -3791,10 +3966,10 @@ static void test_universal_ok_to_save() {
     // Ensure we don't try to save after reading from a newer fish.
     say(L"Testing universal Ok to save");
     if (system("mkdir -p test/fish_uvars_test/")) err(L"mkdir failed");
-    const char *contents = "# VERSION: 99999.99\n";
+    constexpr const char contents[] = "# VERSION: 99999.99\n";
     FILE *fp = fopen(wcs2string(UVARS_TEST_PATH).c_str(), "w");
     assert(fp && "Failed to open UVARS_TEST_PATH for writing");
-    fwrite(contents, std::strlen(contents), 1, fp);
+    fwrite(contents, const_strlen(contents), 1, fp);
     fclose(fp);
 
     file_id_t before_id = file_id_for_path(UVARS_TEST_PATH);
@@ -3843,8 +4018,7 @@ static void trigger_or_wait_for_notification(universal_notifier_t::notifier_stra
             usleep(40000);
             break;
         }
-        case universal_notifier_t::strategy_named_pipe:
-        case universal_notifier_t::strategy_sigio: {
+        case universal_notifier_t::strategy_named_pipe: {
             break;  // nothing required
         }
     }
@@ -3854,9 +4028,6 @@ static void test_notifiers_with_strategy(universal_notifier_t::notifier_strategy
     say(L"Testing universal notifiers with strategy %d", (int)strategy);
     std::unique_ptr<universal_notifier_t> notifiers[16];
     size_t notifier_count = sizeof notifiers / sizeof *notifiers;
-
-    // Set up SIGIO handler as needed.
-    signal_set_handlers(false);
 
     // Populate array of notifiers.
     for (size_t i = 0; i < notifier_count; i++) {
@@ -3907,12 +4078,6 @@ static void test_notifiers_with_strategy(universal_notifier_t::notifier_strategy
 
     // Nobody should poll now.
     for (size_t i = 0; i < notifier_count; i++) {
-        // On BSD, SIGIO may be delivered by read() even if it returns EAGAIN;
-        // that is the polling itself may trigger a SIGIO. Therefore we poll twice.
-        if (strategy == universal_notifier_t::strategy_sigio) {
-            (void)poll_notifier(notifiers[i]);
-        }
-
         if (poll_notifier(notifiers[i])) {
             err(L"Universal variable notifier polled true after all changes, with strategy %d",
                 (int)strategy);
@@ -3933,10 +4098,11 @@ class history_tests_t {
    public:
     static void test_history();
     static void test_history_merge();
+    static void test_history_path_detection();
     static void test_history_formats();
     // static void test_history_speed(void);
     static void test_history_races();
-    static void test_history_races_pound_on_history(size_t item_count);
+    static void test_history_races_pound_on_history(size_t item_count, size_t idx);
 };
 
 static wcstring random_string() {
@@ -3958,10 +4124,10 @@ void history_tests_t::test_history() {
     const history_search_flags_t nocase = history_search_ignore_case;
 
     // Populate a history.
-    history_t &history = history_t::history_with_name(L"test_history");
-    history.clear();
+    std::shared_ptr<history_t> history = history_t::with_name(L"test_history");
+    history->clear();
     for (const wcstring &s : items) {
-        history.add(s);
+        history->add(s);
     }
 
     // Helper to set expected items to those matching a predicate, in reverse order.
@@ -4013,13 +4179,13 @@ void history_tests_t::test_history() {
     // Test item removal case-sensitive.
     searcher = history_search_t(history, L"Alpha");
     test_history_matches(searcher, {L"Alpha"}, __LINE__);
-    history.remove(L"Alpha");
+    history->remove(L"Alpha");
     searcher = history_search_t(history, L"Alpha");
     test_history_matches(searcher, {}, __LINE__);
 
     // Test history escaping and unescaping, yaml, etc.
     history_item_list_t before, after;
-    history.clear();
+    history->clear();
     size_t i, max = 100;
     for (i = 1; i <= max; i++) {
         // Generate a value.
@@ -4039,17 +4205,17 @@ void history_tests_t::test_history() {
         history_item_t item(value, time(NULL));
         item.required_paths = paths;
         before.push_back(item);
-        history.add(item);
+        history->add(std::move(item));
     }
-    history.save();
+    history->save();
 
     // Empty items should just be dropped (#6032).
-    history.add(L"");
-    do_test(!history.item_at_index(1).contents.empty());
+    history->add(L"");
+    do_test(!history->item_at_index(1).contents.empty());
 
     // Read items back in reverse order and ensure they're the same.
     for (i = 100; i >= 1; i--) {
-        history_item_t item = history.item_at_index(i);
+        history_item_t item = history->item_at_index(i);
         do_test(!item.empty());
         after.push_back(item);
     }
@@ -4062,9 +4228,8 @@ void history_tests_t::test_history() {
     }
 
     // Clean up after our tests.
-    history.clear();
+    history->clear();
 }
-
 // Wait until the next second.
 static void time_barrier() {
     time_t start = time(NULL);
@@ -4073,20 +4238,19 @@ static void time_barrier() {
     } while (time(NULL) == start);
 }
 
-static wcstring_list_t generate_history_lines(size_t item_count, int pid) {
+static wcstring_list_t generate_history_lines(size_t item_count, size_t idx) {
     wcstring_list_t result;
     result.reserve(item_count);
     for (unsigned long i = 0; i < item_count; i++) {
-        result.push_back(format_string(L"%ld %lu", (long)pid, (unsigned long)i));
+        result.push_back(format_string(L"%ld %lu", (unsigned long)idx, (unsigned long)i));
     }
     return result;
 }
 
-void history_tests_t::test_history_races_pound_on_history(size_t item_count) {
-    // Called in child process to modify history.
+void history_tests_t::test_history_races_pound_on_history(size_t item_count, size_t idx) {
+    // Called in child thread to modify history.
     history_t hist(L"race_test");
-    hist.chaos_mode = !true;
-    const wcstring_list_t hist_lines = generate_history_lines(item_count, getpid());
+    const wcstring_list_t hist_lines = generate_history_lines(item_count, idx);
     for (const wcstring &line : hist_lines) {
         hist.add(line);
         hist.save();
@@ -4095,6 +4259,21 @@ void history_tests_t::test_history_races_pound_on_history(size_t item_count) {
 
 void history_tests_t::test_history_races() {
     say(L"Testing history race conditions");
+
+    // It appears TSAN and ASAN's allocators do not release their locks properly in atfork, so
+    // allocating with multiple threads risks deadlock. Drain threads before running under ASAN.
+    // TODO: stop forking with these tests.
+    bool needs_thread_drain = false;
+#if __SANITIZE_ADDRESS__
+    needs_thread_drain |= true;
+#endif
+#if defined(__has_feature)
+    needs_thread_drain |= __has_feature(thread_sanitizer) || __has_feature(address_sanitizer);
+#endif
+
+    if (needs_thread_drain) {
+        iothread_drain_all();
+    }
 
     // Test concurrent history writing.
     // How many concurrent writers we have
@@ -4106,30 +4285,22 @@ void history_tests_t::test_history_races() {
     // Ensure history is clear.
     history_t(L"race_test").clear();
 
-    pid_t children[RACE_COUNT];
+    // hist.chaos_mode = true;
+
+    std::thread children[RACE_COUNT];
     for (size_t i = 0; i < RACE_COUNT; i++) {
-        pid_t pid = fork();
-        if (!pid) {
-            // Child process.
-            setup_fork_guards();
-            test_history_races_pound_on_history(ITEM_COUNT);
-            exit_without_destructors(0);
-        } else {
-            // Parent process.
-            children[i] = pid;
-        }
+        children[i] = std::thread([=] { test_history_races_pound_on_history(ITEM_COUNT, i); });
     }
 
     // Wait for all children.
-    for (pid_t child : children) {
-        int stat;
-        waitpid(child, &stat, WUNTRACED);
+    for (std::thread &child : children) {
+        child.join();
     }
 
     // Compute the expected lines.
     std::array<wcstring_list_t, RACE_COUNT> expected_lines;
     for (size_t i = 0; i < RACE_COUNT; i++) {
-        expected_lines[i] = generate_history_lines(ITEM_COUNT, children[i]);
+        expected_lines[i] = generate_history_lines(ITEM_COUNT, i);
     }
 
     // Ensure we consider the lines that have been outputted as part of our history.
@@ -4196,8 +4367,9 @@ void history_tests_t::test_history_merge() {
     say(L"Testing history merge");
     const size_t count = 3;
     const wcstring name = L"merge_test";
-    std::unique_ptr<history_t> hists[count] = {
-        make_unique<history_t>(name), make_unique<history_t>(name), make_unique<history_t>(name)};
+    std::shared_ptr<history_t> hists[count] = {std::make_shared<history_t>(name),
+                                               std::make_shared<history_t>(name),
+                                               std::make_shared<history_t>(name)};
     const wcstring texts[count] = {L"History 1", L"History 2", L"History 3"};
     const wcstring alt_texts[count] = {L"History Alt 1", L"History Alt 2", L"History Alt 3"};
 
@@ -4231,7 +4403,7 @@ void history_tests_t::test_history_merge() {
     // Make a new history. It should contain everything. The time_barrier() is so that the timestamp
     // is newer, since we only pick up items whose timestamp is before the birth stamp.
     time_barrier();
-    std::unique_ptr<history_t> everything = make_unique<history_t>(name);
+    std::shared_ptr<history_t> everything = std::make_shared<history_t>(name);
     for (const auto &text : texts) {
         do_test(history_contains(everything, text));
     }
@@ -4285,6 +4457,86 @@ void history_tests_t::test_history_merge() {
     everything->clear();
 }
 
+void history_tests_t::test_history_path_detection() {
+    // Regression test for #7582.
+    say(L"Testing history path detection");
+    char tmpdirbuff[] = "/tmp/fish_test_history.XXXXXX";
+    wcstring tmpdir = str2wcstring(mkdtemp(tmpdirbuff));
+    if (!string_suffixes_string(L"/", tmpdir)) {
+        tmpdir.push_back(L'/');
+    }
+
+    // Place one valid file in the directory.
+    wcstring filename = L"testfile";
+    std::string path = wcs2string(tmpdir + filename);
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f) {
+        err(L"Failed to open test file from history path detection");
+        return;
+    }
+    fclose(f);
+
+    std::shared_ptr<test_environment_t> vars = std::make_shared<test_environment_t>();
+    vars->vars[L"PWD"] = tmpdir;
+    vars->vars[L"HOME"] = tmpdir;
+
+    std::shared_ptr<history_t> history = history_t::with_name(L"path_detection");
+    history_t::add_pending_with_file_detection(history, L"cmd0 not/a/valid/path", vars);
+    history_t::add_pending_with_file_detection(history, L"cmd1 " + filename, vars);
+    history_t::add_pending_with_file_detection(history, L"cmd2 " + tmpdir + L"/" + filename, vars);
+    history_t::add_pending_with_file_detection(history, L"cmd3  $HOME/" + filename, vars);
+    history_t::add_pending_with_file_detection(history, L"cmd4  $HOME/notafile", vars);
+    history_t::add_pending_with_file_detection(history, L"cmd5  ~/" + filename, vars);
+    history_t::add_pending_with_file_detection(history, L"cmd6  ~/notafile", vars);
+    history_t::add_pending_with_file_detection(history, L"cmd7  ~/*f*", vars);
+    history_t::add_pending_with_file_detection(history, L"cmd8  ~/*zzz*", vars);
+    history->resolve_pending();
+
+    constexpr size_t hist_size = 9;
+    if (history->size() != hist_size) {
+        err(L"history has wrong size: %lu but expected %lu", (unsigned long)history->size(),
+            (unsigned long)hist_size);
+        history->clear();
+        return;
+    }
+
+    // Expected sets of paths.
+    wcstring_list_t expected[hist_size] = {
+        {},                          // cmd0
+        {filename},                  // cmd1
+        {tmpdir + L"/" + filename},  // cmd2
+        {L"$HOME/" + filename},      // cmd3
+        {},                          // cmd4
+        {L"~/" + filename},          // cmd5
+        {},                          // cmd6
+        {},                          // cmd7 - we do not expand globs
+        {},                          // cmd8
+    };
+
+    size_t lap;
+    const size_t maxlap = 128;
+    for (lap = 0; lap < maxlap; lap++) {
+        int failures = 0;
+        bool last = (lap + 1 == maxlap);
+        for (size_t i = 1; i <= hist_size; i++) {
+            if (history->item_at_index(i).required_paths != expected[hist_size - i]) {
+                failures += 1;
+                if (last) {
+                    err(L"Wrong detected paths for item %lu", (unsigned long)i);
+                }
+            }
+        }
+        if (failures == 0) {
+            break;
+        }
+        // The file detection takes a little time since it occurs in the background.
+        // Loop until the test passes.
+        usleep(1E6 / 500);  // 1 msec
+    }
+    // fprintf(stderr, "History saving took %lu laps\n", (unsigned long)lap);
+    history->clear();
+}
+
 static bool install_sample_history(const wchar_t *name) {
     wcstring path;
     if (!path_get_data(path)) {
@@ -4301,7 +4553,7 @@ static bool install_sample_history(const wchar_t *name) {
 }
 
 /// Indicates whether the history is equal to the given null-terminated array of strings.
-static bool history_equals(history_t &hist, const wchar_t *const *strings) {
+static bool history_equals(const shared_ptr<history_t> &hist, const wchar_t *const *strings) {
     // Count our expected items.
     size_t expected_count = 0;
     while (strings[expected_count]) {
@@ -4313,10 +4565,11 @@ static bool history_equals(history_t &hist, const wchar_t *const *strings) {
     size_t array_idx = 0;
     for (;;) {
         const wchar_t *expected = strings[array_idx];
-        history_item_t item = hist.item_at_index(history_idx);
+        history_item_t item = hist->item_at_index(history_idx);
         if (expected == NULL) {
             if (!item.empty()) {
-                err(L"Expected empty item at history index %lu", history_idx);
+                err(L"Expected empty item at history index %lu, instead found: %ls", history_idx,
+                    item.str().c_str());
             }
             break;
         } else {
@@ -4345,11 +4598,11 @@ void history_tests_t::test_history_formats() {
         const wchar_t *const expected[] = {
             L"#def", L"echo #abc", L"function yay\necho hi\nend", L"cd foobar", L"ls /", NULL};
 
-        history_t &test_history = history_t::history_with_name(name);
+        auto test_history = history_t::with_name(name);
         if (!history_equals(test_history, expected)) {
             err(L"test_history_formats failed for %ls\n", name);
         }
-        test_history.clear();
+        test_history->clear();
     }
 
     name = L"history_sample_fish_2_0";
@@ -4360,11 +4613,11 @@ void history_tests_t::test_history_formats() {
         const wchar_t *const expected[] = {L"echo this has\\\nbackslashes",
                                            L"function foo\necho bar\nend", L"echo alpha", NULL};
 
-        history_t &test_history = history_t::history_with_name(name);
+        auto test_history = history_t::with_name(name);
         if (!history_equals(test_history, expected)) {
             err(L"test_history_formats failed for %ls\n", name);
         }
-        test_history.clear();
+        test_history->clear();
     }
 
     say(L"Testing bash import");
@@ -4374,20 +4627,16 @@ void history_tests_t::test_history_formats() {
     } else {
         // The results are in the reverse order that they appear in the bash history file.
         // We don't expect whitespace to be elided (#4908: except for leading/trailing whitespace)
-        const wchar_t *expected[] = {L"sleep 123",
-                                     L"a && echo valid construct",
-                                     L"final line",
-                                     L"echo supsup",
-                                     L"export XVAR='exported'",
-                                     L"history --help",
-                                     L"echo foo",
-                                     NULL};
-        history_t &test_history = history_t::history_with_name(L"bash_import");
-        test_history.populate_from_bash(f);
+        const wchar_t *expected[] = {
+            L"EOF",                  L"sleep 123",   L"a && echo valid construct",
+            L"final line",           L"echo supsup", L"export XVAR='exported'",
+            L"history --help",       L"echo foo",    NULL};
+        auto test_history = history_t::with_name(L"bash_import");
+        test_history->populate_from_bash(f);
         if (!history_equals(test_history, expected)) {
             err(L"test_history_formats failed for bash import\n");
         }
-        test_history.clear();
+        test_history->clear();
         fclose(f);
     }
 
@@ -4397,13 +4646,13 @@ void history_tests_t::test_history_formats() {
         err(L"Couldn't open file tests/%ls", name);
     } else {
         // We simply invoke get_string_representation. If we don't die, the test is a success.
-        history_t &test_history = history_t::history_with_name(name);
+        auto test_history = history_t::with_name(name);
         const wchar_t *expected[] = {L"no_newline_at_end_of_file", L"corrupt_prefix",
                                      L"this_command_is_ok", NULL};
         if (!history_equals(test_history, expected)) {
             err(L"test_history_formats failed for %ls\n", name);
         }
-        test_history.clear();
+        test_history->clear();
     }
 }
 
@@ -4548,6 +4797,10 @@ static bool test_1_parse_ll2(const wcstring &src, wcstring *out_cmd, wcstring *o
             statement = tmp;
         }
     }
+    if (!statement) {
+        say(L"No decorated statement found in '%ls'", src.c_str());
+        return false;
+    }
 
     // Return its decoration and command.
     *out_deco = statement->decoration();
@@ -4669,6 +4922,18 @@ static void test_new_parser_ad_hoc() {
     // because we don't want to color it as an error.
     ast = ast_t::parse(L"a=", parse_flag_leave_unterminated);
     do_test(!ast.errored());
+
+    parse_error_list_t errors;
+    ast = ast_t::parse(L"begin; echo (", parse_flag_leave_unterminated, &errors);
+    do_test(errors.size() == 1 && errors.at(0).code == parse_error_tokenizer_unterminated_subshell);
+
+    errors.clear();
+    ast = ast_t::parse(L"for x in (", parse_flag_leave_unterminated, &errors);
+    do_test(errors.size() == 1 && errors.at(0).code == parse_error_tokenizer_unterminated_subshell);
+
+    errors.clear();
+    ast = ast_t::parse(L"begin; echo '", parse_flag_leave_unterminated, &errors);
+    do_test(errors.size() == 1 && errors.at(0).code == parse_error_tokenizer_unterminated_quote);
 }
 
 static void test_new_parser_errors() {
@@ -4824,9 +5089,11 @@ static void test_error_messages() {
 
 static void test_highlighting() {
     say(L"Testing syntax highlighting");
-    if (system("mkdir -p test/fish_highlight_test/")) err(L"mkdir failed");
-    if (system("touch test/fish_highlight_test/foo")) err(L"touch failed");
-    if (system("touch test/fish_highlight_test/bar")) err(L"touch failed");
+    if (!pushd("test/fish_highlight_test/")) return;
+    cleanup_t pop{[] { popd(); }};
+    if (system("mkdir -p dir")) err(L"mkdir failed");
+    if (system("touch foo")) err(L"touch failed");
+    if (system("touch bar")) err(L"touch failed");
 
     // Here are the components of our source and the colors we expect those to be.
     struct highlight_component_t {
@@ -4845,37 +5112,38 @@ static void test_highlighting() {
     param_valid_path.valid_path = true;
 
     highlight_tests.push_back({{L"echo", highlight_role_t::command},
-                               {L"test/fish_highlight_test/foo", param_valid_path},
+                               {L"./foo", param_valid_path},
                                {L"&", highlight_role_t::statement_terminator}});
 
     highlight_tests.push_back({
-        {L"command", highlight_role_t::command},
+        {L"command", highlight_role_t::keyword},
         {L"echo", highlight_role_t::command},
         {L"abc", highlight_role_t::param},
-        {L"test/fish_highlight_test/foo", param_valid_path},
+        {L"foo", param_valid_path},
         {L"&", highlight_role_t::statement_terminator},
     });
 
     highlight_tests.push_back({
-        {L"if command ls", highlight_role_t::command},
+        {L"if command", highlight_role_t::keyword},
+        {L"ls", highlight_role_t::command},
         {L"; ", highlight_role_t::statement_terminator},
         {L"echo", highlight_role_t::command},
         {L"abc", highlight_role_t::param},
         {L"; ", highlight_role_t::statement_terminator},
         {L"/bin/definitely_not_a_command", highlight_role_t::error},
         {L"; ", highlight_role_t::statement_terminator},
-        {L"end", highlight_role_t::command},
+        {L"end", highlight_role_t::keyword},
     });
 
     // Verify that cd shows errors for non-directories.
     highlight_tests.push_back({
         {L"cd", highlight_role_t::command},
-        {L"test/fish_highlight_test", param_valid_path},
+        {L"dir", param_valid_path},
     });
 
     highlight_tests.push_back({
         {L"cd", highlight_role_t::command},
-        {L"test/fish_highlight_test/foo", highlight_role_t::error},
+        {L"foo", highlight_role_t::error},
     });
 
     highlight_tests.push_back({
@@ -4945,9 +5213,46 @@ static void test_highlighting() {
     });
 
     highlight_tests.push_back({
+        {L"for", highlight_role_t::keyword},
+        {L"x", highlight_role_t::param},
+        {L"in", highlight_role_t::keyword},
+        {L"set-by-for-1", highlight_role_t::param},
+        {L"set-by-for-2", highlight_role_t::param},
+        {L";", highlight_role_t::statement_terminator},
+        {L"echo", highlight_role_t::command},
+        {L">", highlight_role_t::redirection},
+        {L"$x", highlight_role_t::redirection},
+        {L";", highlight_role_t::statement_terminator},
+        {L"end", highlight_role_t::keyword},
+    });
+
+    highlight_tests.push_back({
+        {L"set", highlight_role_t::command},
+        {L"x", highlight_role_t::param},
+        {L"set-by-set", highlight_role_t::param},
+        {L";", highlight_role_t::statement_terminator},
+        {L"echo", highlight_role_t::command},
+        {L">", highlight_role_t::redirection},
+        {L"$x", highlight_role_t::redirection},
+        {L"2>", highlight_role_t::redirection},
+        {L"$totally_not_x", highlight_role_t::error},
+        {L"<", highlight_role_t::redirection},
+        {L"$x_but_its_an_impostor", highlight_role_t::error},
+    });
+
+    highlight_tests.push_back({
+        {L"x", highlight_role_t::param, ns},
+        {L"=", highlight_role_t::operat, ns},
+        {L"set-by-variable-override", highlight_role_t::param, ns},
+        {L"echo", highlight_role_t::command},
+        {L">", highlight_role_t::redirection},
+        {L"$x", highlight_role_t::redirection},
+    });
+
+    highlight_tests.push_back({
         {L"end", highlight_role_t::error},
         {L";", highlight_role_t::statement_terminator},
-        {L"if", highlight_role_t::command},
+        {L"if", highlight_role_t::keyword},
         {L"end", highlight_role_t::error},
     });
 
@@ -4977,12 +5282,12 @@ static void test_highlighting() {
     });
 
     highlight_tests.push_back({
-        {L"for", highlight_role_t::command},
+        {L"for", highlight_role_t::keyword},
         {L"i", highlight_role_t::param},
-        {L"in", highlight_role_t::command},
+        {L"in", highlight_role_t::keyword},
         {L"1 2 3", highlight_role_t::param},
         {L";", highlight_role_t::statement_terminator},
-        {L"end", highlight_role_t::command},
+        {L"end", highlight_role_t::keyword},
     });
 
     highlight_tests.push_back({
@@ -5005,7 +5310,7 @@ static void test_highlighting() {
     });
 
     highlight_tests.push_back({
-        {L"if", highlight_role_t::command},
+        {L"if", highlight_role_t::keyword},
         {L"true", highlight_role_t::command},
         {L"&&", highlight_role_t::operat},
         {L"false", highlight_role_t::command},
@@ -5020,7 +5325,7 @@ static void test_highlighting() {
         {L"!", highlight_role_t::operat},
         {L"true", highlight_role_t::command},
         {L";", highlight_role_t::statement_terminator},
-        {L"end", highlight_role_t::command},
+        {L"end", highlight_role_t::keyword},
     });
 
     highlight_tests.push_back({
@@ -5060,6 +5365,13 @@ static void test_highlighting() {
         {L"echo", highlight_role_t::command},
         {L"stuff", highlight_role_t::param},
         {L"# comment", highlight_role_t::comment},
+    });
+
+    // Overlong paths don't crash (#7837).
+    const wcstring overlong = get_overlong_path();
+    highlight_tests.push_back({
+        {L"touch", highlight_role_t::command},
+        {overlong.c_str(), highlight_role_t::param},
     });
 
     highlight_tests.push_back({
@@ -5227,20 +5539,26 @@ static void test_pcre2_escape() {
     }
 }
 
-maybe_t<int> builtin_string(parser_t &parser, io_streams_t &streams, wchar_t **argv);
-static void run_one_string_test(const wchar_t *const *argv, int expected_rc,
+maybe_t<int> builtin_string(parser_t &parser, io_streams_t &streams, const wchar_t **argv);
+static void run_one_string_test(const wchar_t *const *argv_raw, int expected_rc,
                                 const wchar_t *expected_out) {
+    // Copy to a null terminated array, as builtin_string may wish to rearrange our pointers.
+    wcstring_list_t argv_list(argv_raw, argv_raw + null_terminated_array_length(argv_raw));
+    null_terminated_array_t<wchar_t> argv(argv_list);
+
     parser_t &parser = parser_t::principal_parser();
-    buffered_output_stream_t outs{0};
+    string_output_stream_t outs{};
     null_output_stream_t errs{};
     io_streams_t streams(outs, errs);
     streams.stdin_is_directly_redirected = false;  // read from argv instead of stdin
-    maybe_t<int> rc = builtin_string(parser, streams, const_cast<wchar_t **>(argv));
+    maybe_t<int> rc = builtin_string(parser, streams, argv.get());
+
     wcstring args;
-    for (int i = 0; argv[i] != NULL; i++) {
-        args += escape_string(argv[i], ESCAPE_ALL) + L' ';
+    for (const wcstring &arg : argv_list) {
+        args += escape_string(arg, ESCAPE_ALL) + L' ';
     }
     args.resize(args.size() - 1);
+
     if (rc != expected_rc) {
         std::wstring got = rc ? std::to_wstring(rc.value()) : L"nothing";
         err(L"Test failed on line %lu: [%ls]: expected return code %d but got %s", __LINE__,
@@ -5910,6 +6228,47 @@ void test_normalize_path() {
     do_test(path_normalize_for_cd(L"/abc/def/", L"../ghi/..") == L"/abc/ghi/..");
 }
 
+void test_dirname_basename() {
+    say(L"Testing wdirname and wbasename");
+    const struct testcase_t {
+        const wchar_t *path;
+        const wchar_t *dir;
+        const wchar_t *base;
+    } testcases[] = {
+        {L"", L".", L"."},
+        {L"foo//", L".", L"foo"},
+        {L"foo//////", L".", L"foo"},
+        {L"/////foo", L"/", L"foo"},
+        {L"/////foo", L"/", L"foo"},
+        {L"//foo/////bar", L"//foo", L"bar"},
+        {L"foo/////bar", L"foo", L"bar"},
+
+        // Examples given in XPG4.2.
+        {L"/usr/lib", L"/usr", L"lib"},
+        {L"usr", L".", L"usr"},
+        {L"/", L"/", L"/"},
+        {L".", L".", L"."},
+        {L"..", L".", L".."},
+    };
+    for (const auto &tc : testcases) {
+        wcstring dir = wdirname(tc.path);
+        if (dir != tc.dir) {
+            err(L"Wrong dirname for \"%ls\": expected \"%ls\", got \"%ls\"", tc.path, tc.dir,
+                dir.c_str());
+        }
+        wcstring base = wbasename(tc.path);
+        if (base != tc.base) {
+            err(L"Wrong basename for \"%ls\": expected \"%ls\", got \"%ls\"", tc.path, tc.base,
+                base.c_str());
+        }
+    }
+    // Ensures strings which greatly exceed PATH_MAX still work (#7837).
+    wcstring longpath = get_overlong_path();
+    wcstring longpath_dir = longpath.substr(0, longpath.rfind(L'/'));
+    do_test(wdirname(longpath) == longpath_dir);
+    do_test(wbasename(longpath) == L"overlong");
+}
+
 static void test_topic_monitor() {
     say(L"Testing topic monitor");
     topic_monitor_t monitor;
@@ -5971,8 +6330,54 @@ static void test_topic_monitor_torture() {
     while (completed.load(std::memory_order_relaxed) < thread_count) {
         post_count += 1;
         monitor.post(t1);
+        std::this_thread::yield();
     }
     for (auto &t : threads) t.join();
+}
+
+static void test_pipes() {
+    say(L"Testing pipes");
+    // Here we just test that each pipe has CLOEXEC set and is in the high range.
+    // Note pipe creation may fail due to fd exhaustion; don't fail in that case.
+    std::vector<autoclose_pipes_t> pipes;
+    for (int i = 0; i < 10; i++) {
+        if (auto pipe = make_autoclose_pipes()) {
+            pipes.push_back(pipe.acquire());
+        }
+    }
+    for (const auto &pipe : pipes) {
+        for (int fd : {pipe.read.fd(), pipe.write.fd()}) {
+            do_test(fd >= k_first_high_fd);
+            int flags = fcntl(fd, F_GETFD, 0);
+            do_test(flags >= 0);
+            do_test(bool(flags & FD_CLOEXEC));
+        }
+    }
+}
+
+static void test_fd_event_signaller() {
+    say(L"Testing fd event signaller");
+    fd_event_signaller_t sema;
+    do_test(!sema.try_consume());
+    do_test(!sema.poll());
+
+    // Post once.
+    sema.post();
+    do_test(sema.poll());
+    do_test(sema.poll());
+    do_test(sema.try_consume());
+    do_test(!sema.poll());
+    do_test(!sema.try_consume());
+
+    // Posts are coalesced.
+    sema.post();
+    sema.post();
+    sema.post();
+    do_test(sema.poll());
+    do_test(sema.poll());
+    do_test(sema.try_consume());
+    do_test(!sema.poll());
+    do_test(!sema.try_consume());
 }
 
 static void test_timer_format() {
@@ -6144,6 +6549,7 @@ int main(int argc, char **argv) {
     if (should_test_function("escape")) test_escape_quotes();
     if (should_test_function("format")) test_format();
     if (should_test_function("convert")) test_convert();
+    if (should_test_function("convert")) test_convert_private_use();
     if (should_test_function("convert_ascii")) test_convert_ascii();
     if (should_test_function("perf_convert_ascii", false)) perf_convert_ascii();
     if (should_test_function("convert_nulls")) test_convert_nulls();
@@ -6180,7 +6586,6 @@ int main(int argc, char **argv) {
     if (should_test_function("complete")) test_complete();
     if (should_test_function("autoload")) test_autoload();
     if (should_test_function("input")) test_input();
-    if (should_test_function("io")) test_fd_set();
     if (should_test_function("line_iterator")) test_line_iterator();
     if (should_test_function("undo")) test_undo();
     if (should_test_function("universal")) test_universal();
@@ -6197,6 +6602,7 @@ int main(int argc, char **argv) {
     if (should_test_function("autosuggest_suggest_special")) test_autosuggest_suggest_special();
     if (should_test_function("history")) history_tests_t::test_history();
     if (should_test_function("history_merge")) history_tests_t::test_history_merge();
+    if (should_test_function("history_paths")) history_tests_t::test_history_path_detection();
     if (!is_windows_subsystem_for_linux()) {
         // this test always fails under WSL
         if (should_test_function("history_races")) history_tests_t::test_history_races();
@@ -6208,8 +6614,11 @@ int main(int argc, char **argv) {
     if (should_test_function("layout_cache")) test_layout_cache();
     if (should_test_function("prompt")) test_prompt_truncation();
     if (should_test_function("normalize")) test_normalize_path();
+    if (should_test_function("dirname")) test_dirname_basename();
     if (should_test_function("topics")) test_topic_monitor();
     if (should_test_function("topics")) test_topic_monitor_torture();
+    if (should_test_function("pipes")) test_pipes();
+    if (should_test_function("fd_event")) test_fd_event_signaller();
     if (should_test_function("timer_format")) test_timer_format();
     // history_tests_t::test_history_speed();
 

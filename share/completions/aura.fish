@@ -1,7 +1,7 @@
 # This can't currently be wrapped as the pacman completions rely on variables whose value this needs to change
 # complete -c aura -w pacman
 set -l listinstalled "(pacman -Q | tr ' ' \t)"
-set -l listall "(__fish_print_packages)"
+set -l listall "(__fish_print_pacman_packages)"
 set -l listrepos "(__fish_print_pacman_repos)"
 set -l listgroups "(pacman -Sg | sed 's/\(.*\)/\1\tPackage group/g')"
 
@@ -87,7 +87,7 @@ for condition in query sync
     complete -c aura -n $$condition -s s -l search -r -d 'Search packages for regexp'
 end
 
-for condition in abs aur
+for condition in aur
     complete -c aura -n $$condition -s a -l delmakedeps -d 'Remove packages only needed during installation'
     complete -c aura -n $$condition -s d -l deps -d 'View package dependencies'
     complete -c aura -n $$condition -s i -l info -d 'View package information'
@@ -163,6 +163,6 @@ complete -c aura -n $sync -s y -l refresh -d 'Download fresh copy of the package
 complete -c aura -n "$sync; and $argument" -xa "$listall $listgroups"
 
 # Upgrade options
-complete -c aura -n "$upgrade; and $argument" -xa '(__fish_complete_suffix pkg.tar.xz)' -d 'Package file'
-complete -c aura -n "$upgrade; and $argument" -xa '(__fish_complete_suffix pkg.tar.gz)' -d 'Package file'
-complete -c aura -n "$upgrade; and $argument" -xa '(__fish_complete_suffix pkg.tar.zst)' -d 'Package file'
+complete -c aura -n "$upgrade; and $argument" -k -xa '(__fish_complete_suffix pkg.tar.xz)' -d 'Package file'
+complete -c aura -n "$upgrade; and $argument" -k -xa '(__fish_complete_suffix pkg.tar.gz)' -d 'Package file'
+complete -c aura -n "$upgrade; and $argument" -k -xa '(__fish_complete_suffix pkg.tar.zst)' -d 'Package file'

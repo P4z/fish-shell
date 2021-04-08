@@ -39,6 +39,16 @@
 #define OS_IS_CYGWIN
 #endif
 
+// Check if Thread Sanitizer is enabled.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define FISH_TSAN_WORKAROUNDS 1
+#endif
+#endif
+#ifdef __SANITIZE_THREAD__
+#define FISH_TSAN_WORKAROUNDS 1
+#endif
+
 // Common string type.
 typedef std::wstring wcstring;
 typedef std::vector<wcstring> wcstring_list_t;
@@ -201,6 +211,10 @@ extern const wchar_t *program_name;
 /// Set to false if it's been determined we can't trust the last modified timestamp on the tty.
 extern const bool has_working_tty_timestamps;
 
+/// A global, empty string. This is useful for functions which wish to return a reference to an
+/// empty string.
+extern const wcstring g_empty_string;
+
 // Pause for input, then exit the program. If supported, print a backtrace first.
 // The `return` will never be run  but silences oclint warnings. Especially when this is called
 // from within a `switch` block. As of the time I'm writing this oclint doesn't recognize the
@@ -291,6 +305,10 @@ wcstring str2wcstring(const std::string &in, size_t len);
 /// This function decodes illegal character sequences in a reversible way using the private use
 /// area.
 std::string wcs2string(const wcstring &input);
+std::string wcs2string(const wchar_t *in, size_t len);
+
+/// Like wcs2string, but appends to \p receiver instead of returning a new string.
+void wcs2string_appending(const wchar_t *in, size_t len, std::string *receiver);
 
 // Check if we are running in the test mode, where we should suppress error output
 #define TESTS_PROGRAM_NAME L"(ignore)"
@@ -306,8 +324,8 @@ void assert_is_background_thread(const char *who);
 
 /// Useful macro for asserting that a lock is locked. This doesn't check whether this thread locked
 /// it, which it would be nice if it did, but here it is anyways.
-void assert_is_locked(void *mutex, const char *who, const char *caller);
-#define ASSERT_IS_LOCKED(x) assert_is_locked(reinterpret_cast<void *>(&x), #x, __FUNCTION__)
+void assert_is_locked(std::mutex &mutex, const char *who, const char *caller);
+#define ASSERT_IS_LOCKED(m) assert_is_locked(m, #m, __FUNCTION__)
 
 /// Format the specified size (in bytes, kilobytes, etc.) into the specified stringbuffer.
 wcstring format_size(long long sz);
@@ -333,8 +351,7 @@ void format_ullong_safe(wchar_t buff[64], unsigned long long val);
 /// "Narrows" a wide character string. This just grabs any ASCII characters and trunactes.
 void narrow_string_safe(char buff[64], const wchar_t *s);
 
-typedef std::lock_guard<std::mutex> scoped_lock;
-typedef std::lock_guard<std::recursive_mutex> scoped_rlock;
+using scoped_lock = std::lock_guard<std::mutex>;
 
 // An object wrapping a scoped lock and a value
 // This is returned from owning_lock.acquire()
@@ -436,50 +453,6 @@ class scoped_push {
         }
     }
 };
-
-/// A helper class for managing and automatically closing a file descriptor.
-class autoclose_fd_t {
-    int fd_;
-
-   public:
-    // Closes the fd if not already closed.
-    void close();
-
-    // Returns the fd.
-    int fd() const { return fd_; }
-
-    // Returns the fd, transferring ownership to the caller.
-    int acquire() {
-        int temp = fd_;
-        fd_ = -1;
-        return temp;
-    }
-
-    // Resets to a new fd, taking ownership.
-    void reset(int fd) {
-        if (fd == fd_) return;
-        close();
-        fd_ = fd;
-    }
-
-    // \return if this has a valid fd.
-    bool valid() const { return fd_ >= 0; }
-
-    autoclose_fd_t(const autoclose_fd_t &) = delete;
-    void operator=(const autoclose_fd_t &) = delete;
-    autoclose_fd_t(autoclose_fd_t &&rhs) : fd_(rhs.fd_) { rhs.fd_ = -1; }
-
-    void operator=(autoclose_fd_t &&rhs) {
-        close();
-        std::swap(this->fd_, rhs.fd_);
-    }
-
-    explicit autoclose_fd_t(int fd = -1) : fd_(fd) {}
-    ~autoclose_fd_t() { close(); }
-};
-
-/// Close a file descriptor \p fd, retrying on EINTR.
-void exec_close(int fd);
 
 wcstring format_string(const wchar_t *format, ...);
 wcstring vformat_string(const wchar_t *format, va_list va_orig);
@@ -668,6 +641,7 @@ std::string get_path_to_tmp_dir();
 
 bool valid_var_name_char(wchar_t chr);
 bool valid_var_name(const wcstring &str);
+bool valid_var_name(const wchar_t *str);
 bool valid_func_name(const wcstring &str);
 
 // Return values (`$status` values for fish scripts) for various situations.
@@ -683,13 +657,9 @@ enum {
 
     /// The status code used when a command was not found.
     STATUS_CMD_UNKNOWN = 127,
-    /// TODO: Figure out why we have two distinct failure codes for when an external command cannot
-    /// be run.
-    ///
+
     /// The status code used when an external command can not be run.
     STATUS_NOT_EXECUTABLE = 126,
-    /// The status code used when an external command can not be run.
-    STATUS_EXEC_FAIL = 125,
 
     /// The status code used when a wildcard had no matches.
     STATUS_UNMATCHED_WILDCARD = 124,
@@ -745,5 +715,52 @@ struct cleanup_t {
 };
 
 bool is_console_session();
+
+/// Compile-time agnostic-size strcmp/wcscmp implementation. Unicode-unaware.
+template <typename T>
+constexpr ssize_t const_strcmp(const T *lhs, const T *rhs) {
+    return (*lhs == *rhs) ? (*lhs == 0 ? 0 : const_strcmp(lhs + 1, rhs + 1))
+                          : (*lhs > *rhs ? 1 : -1);
+}
+static_assert(const_strcmp("", "a") < 0, "const_strcmp failure");
+static_assert(const_strcmp("a", "a") == 0, "const_strcmp failure");
+static_assert(const_strcmp("a", "") > 0, "const_strcmp failure");
+static_assert(const_strcmp("aa", "a") > 0, "const_strcmp failure");
+static_assert(const_strcmp("a", "aa") < 0, "const_strcmp failure");
+static_assert(const_strcmp("b", "aa") > 0, "const_strcmp failure");
+
+/// Compile-time agnostic-size strlen/wcslen implementation. Unicode-unaware.
+template <typename T, size_t N>
+constexpr size_t const_strlen(const T(&val)[N], ssize_t index = -1) {
+    // N is the length of the character array, but that includes one **or more** trailing nuls.
+    static_assert(N > 0, "Invalid input to const_strlen");
+    return index == -1 ?
+        // Assume a minimum of one trailing nul and do a quick check for the usual case (single
+        // trailing nul) before recursing:
+        N - 1 - (N <= 2 || val[N-2] != static_cast<T>(0) ? 0 : const_strlen(val, N - 2))
+        // Prevent an underflow in case the string is comprised of all \0 bytes
+        : index == 0 ? 0
+        // Keep back-tracking until a non-nul byte is found
+        : (val[index] != static_cast<T>(0) ? 0 : 1 + const_strlen(val, index - 1));
+}
+static_assert(const_strlen("") == 0, "const_strlen failure");
+static_assert(const_strlen("a") == 1, "const_strlen failure");
+static_assert(const_strlen("hello") == 5, "const_strlen failure");
+
+/// Compile-time assertion of alphabetical sort of array `array`, by specified
+/// parameter `accessor`. This is only a macro because constexpr lambdas (to
+/// specify the accessor for the sort key) are C++17 and up.
+#define ASSERT_SORT_ORDER(array, accessor) \
+    struct verify_ ## array ## _sort_t { \
+        template <class T, size_t N> \
+        constexpr static bool validate(T(&vals)[N], size_t idx = 0) { \
+            return (idx == (((sizeof(array) / sizeof(vals[0]))) - 1)) \
+                   ? true \
+                   : const_strcmp(vals[idx] accessor, vals[idx + 1] accessor) <= 0 && \
+                         verify_ ## array ## _sort_t::validate<T, N>(vals, idx + 1); \
+    } \
+}; \
+static_assert(verify_ ## array ## _sort_t::validate(array), \
+              #array " members not in asciibetical order!");
 
 #endif  // FISH_COMMON_H

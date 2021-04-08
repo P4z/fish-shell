@@ -206,7 +206,7 @@ static size_t parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long
         const wchar_t *end;
         long tmp;
         if (idx.empty() && in[pos] == L'.' && in[pos + 1] == L'.') {
-            // If we are at the first index expression, a missing start index means the range starts
+            // If we are at the first index expression, a missing start-index means the range starts
             // at the first item.
             tmp = 1;  // first index
             end = &in[pos];
@@ -229,7 +229,7 @@ static size_t parse_slice(const wchar_t *in, wchar_t **end_ptr, std::vector<long
             while (iswspace(in[pos])) pos++;  // Allow the space in "[.. ]".
 
             long tmp1;
-            // Check if we are at the last index range expression, a missing end index means the
+            // If we are at the last index range expression  then a missing end-index means the
             // range spans until the last item.
             if (in[pos] == L']') {
                 tmp1 = -1;  // last index
@@ -355,13 +355,13 @@ static expand_result_t expand_variables(wcstring instr, completion_receiver_t *o
     // Do a dirty hack to make sliced history fast (#4650). We expand from either a variable, or a
     // history_t. Note that "history" is read only in env.cpp so it's safe to special-case it in
     // this way (it cannot be shadowed, etc).
-    history_t *history = nullptr;
+    std::shared_ptr<history_t> history{};
     maybe_t<env_var_t> var{};
     if (var_name == L"history") {
         // Note reader_get_history may return null, if we are running non-interactively (e.g. from
         // web_config).
         if (is_main_thread()) {
-            history = &history_t::history_with_name(history_session_id(env_stack_t::principal()));
+            history = history_t::with_name(history_session_id(env_stack_t::principal()));
         }
     } else if (var_name != wcstring{VARIABLE_EXPAND_EMPTY}) {
         var = vars.get(var_name);
@@ -1146,7 +1146,7 @@ expand_result_t expander_t::expand_string(wcstring input, completion_receiver_t 
 expand_result_t expand_string(wcstring input, completion_list_t *out_completions,
                               expand_flags_t flags, const operation_context_t &ctx,
                               parse_error_list_t *errors) {
-    completion_receiver_t recv(std::move(*out_completions));
+    completion_receiver_t recv(std::move(*out_completions), ctx.expansion_limit);
     auto res = expand_string(std::move(input), &recv, flags, ctx, errors);
     *out_completions = recv.take();
     return res;
@@ -1176,16 +1176,20 @@ bool expand_one(wcstring &string, expand_flags_t flags, const operation_context_
 
 expand_result_t expand_to_command_and_args(const wcstring &instr, const operation_context_t &ctx,
                                            wcstring *out_cmd, wcstring_list_t *out_args,
-                                           parse_error_list_t *errors) {
+                                           parse_error_list_t *errors, bool skip_wildcards) {
     // Fast path.
     if (expand_is_clean(instr)) {
         *out_cmd = instr;
         return expand_result_t::ok;
     }
 
+    expand_flags_t eflags{expand_flag::skip_cmdsubst};
+    if (skip_wildcards) {
+        eflags.set(expand_flag::skip_wildcards);
+    }
+
     completion_list_t completions;
-    expand_result_t expand_err =
-        expand_string(instr, &completions, {expand_flag::skip_cmdsubst}, ctx, errors);
+    expand_result_t expand_err = expand_string(instr, &completions, eflags, ctx, errors);
     if (expand_err == expand_result_t::ok) {
         // The first completion is the command, any remaning are arguments.
         bool first = true;

@@ -28,8 +28,8 @@ which means you are all set up and can start using fish::
 
 
 This prompt that you see above is the fish default prompt: it shows your username, hostname, and working directory.
-- to change this prompt see `how to change your prompt <#prompt>`_
-- to switch to fish permanently see `switch your default shell to fish <#switching-to-fish>`_.
+- to change this prompt see :ref:`how to change your prompt <prompt>`
+- to switch to fish permanently see :ref:`switch your default shell to fish <switching-to-fish>`.
 
 From now on, we'll pretend your prompt is just a ``>`` to save space.
 
@@ -275,6 +275,8 @@ You can erase (or "delete") a variable with ``-e`` or ``--erase``
     > env | grep MyVariable
     (no output)
 
+.. _tut-exports:
+
 Exports (Shell Variables)
 -------------------------
 
@@ -290,6 +292,9 @@ To give a variable to an external command, it needs to be "exported". Unlike oth
 
 It can also be unexported with ``--unexport`` or ``-u``.
 
+This works the other way around as well! If fish is started by something else, it inherits that parents exported variables. So if your terminal emulator starts fish, and it exports ``$LANG`` set to ``en_US.UTF-8``, fish will receive that setting. And whatever started your terminal emulator also gave *it* some variables that it will then pass on unless it specifically decides not to. This is how fish usually receives the values for things like ``$LANG``, ``$PATH`` and ``$TERM``, without you having to specify them again.
+
+Note that exported variables can be local or global or universal - "exported" is not a :ref:`scope <variables-scope>`. Usually you'd make them global via ``set -gx MyVariable SomeValue``.
 
 .. _tut-lists:
 
@@ -368,7 +373,7 @@ Lists adjacent to other lists or strings are expanded as :ref:`cartesian product
     1 2 3 banana
 
 
-This is similar to `Brace expansion <index#expand-brace>`__.
+This is similar to :ref:`Brace expansion <expand-brace>`.
 
 Command Substitutions
 ---------------------
@@ -456,13 +461,13 @@ Here, ``make`` is only executed if ``./configure`` succeeds (returns 0), and ``s
 
 fish also supports :ref:`and <cmd-and>`, :ref:`or <cmd-or>`, and :ref:`not <cmd-not>`. The first two are job modifiers and have lower precedence. Example usage::
 
-    > cp file1.txt file1_bak.txt && cp file2.txt file2_bak.txt ; and echo "Backup successful"; or echo "Backup failed"
+    > cp file1 file1_bak && cp file2 file2_bak; and echo "Backup successful"; or echo "Backup failed"
     Backup failed
 
 
 As mentioned in :ref:`the section on the semicolon <tut-semicolon>`, this can also be written in multiple lines, like so::
 
-    cp file1.txt file1_bak.txt && cp file2.txt file2_bak.txt
+    cp file1 file1_bak && cp file2 file2_bak
     and echo "Backup successful"
     or echo "Backup failed"
 
@@ -504,7 +509,9 @@ To compare strings or numbers or check file properties (whether a file exists or
 
     # or
 
-    if test -e /etc/hosts # is true if the path /etc/hosts exists - it could be a file or directory or symlink (or possibly something else).
+    # This test is true if the path /etc/hosts exists
+    # - it could be a file or directory or symlink (or possibly something else).
+    if test -e /etc/hosts
         echo We most likely have a hosts file
     else
         echo We do not have a hosts file
@@ -553,7 +560,7 @@ A fish function is a list of commands, which may optionally take arguments. Unli
     Hello everybody!
 
 
-Unlike other shells, fish does not have aliases or special prompt syntax. Functions take their place.
+Unlike other shells, fish does not have aliases or special prompt syntax. Functions take their place. [#]_
 
 You can list the names of all functions with the :ref:`functions <cmd-functions>` builtin (note the plural!). fish starts out with a number of functions::
 
@@ -568,6 +575,7 @@ You can see the source for any function by passing its name to ``functions``::
         command ls -G $argv
     end
 
+.. [#] There is a function called :ref:`alias <cmd-alias>`, but it's just a shortcut to make functions.
 
 Loops
 -----
@@ -640,6 +648,8 @@ $PATH
 -----
 
 ``$PATH`` is an environment variable containing the directories that fish searches for commands. Unlike other shells, $PATH is a :ref:`list <tut-lists>`, not a colon-delimited string.
+
+Fish takes care to set ``$PATH`` to a default, but typically it is just inherited from fish's parent process and is set to a value that makes sense for the system - see :ref:`Exports <tut-exports>`.
 
 To prepend /usr/local/bin and /usr/sbin to ``$PATH``, you can write::
 
@@ -750,6 +760,7 @@ Change your default shell with::
 
     > chsh -s /usr/local/bin/fish
 
+This assumes you installed fish to /usr/local/bin, which is the default location when you've compiled it yourself. If you installed it with a package manager, the usual location is /usr/bin/fish, but package managers typically already add it to /etc/shells. Just substitute the correct location.
 
 (To change it back to another shell, just substitute ``/usr/local/bin/fish``
 with ``/bin/bash``, ``/bin/tcsh`` or ``/bin/zsh`` as appropriate in the steps above.)

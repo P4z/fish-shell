@@ -1,7 +1,6 @@
 from __future__ import unicode_literals
 from __future__ import print_function
 import binascii
-import cgi
 
 try:
     from html import escape as escape_html
@@ -21,6 +20,11 @@ import tempfile
 import threading
 from itertools import chain
 
+COMMON_WSL_CMD_PATHS = (
+    "/mnt/c/Windows/System32",
+    "/windir/c/Windows/System32",
+    "/c/Windows/System32",
+)
 FISH_BIN_PATH = False  # will be set later
 IS_PY2 = sys.version_info[0] == 2
 
@@ -33,9 +37,27 @@ else:
     import socketserver as SocketServer
     from urllib.parse import parse_qs
 
+try:
+    import json
+except ImportError:
+    import simplejson as json
 
-def find_executable(exe):
-    for p in os.environ["PATH"].split(os.pathsep):
+
+# Disable CLI web browsers
+term = os.environ.pop("TERM", None)
+# This import must be done with an empty $TERM, otherwise a command-line browser may be started
+# which will block the whole process - see https://docs.python.org/3/library/webbrowser.html
+import webbrowser
+
+if term:
+    os.environ["TERM"] = term
+
+
+def find_executable(exe, paths=()):
+    final_path = os.environ["PATH"].split(os.pathsep)
+    if paths:
+        final_path.extend(paths)
+    for p in final_path:
         proposed_path = os.path.join(p, exe)
         if os.access(proposed_path, os.X_OK):
             return proposed_path
@@ -64,19 +86,14 @@ def is_termux():
     return "com.termux" in os.environ["PATH"] and find_executable("termux-open-url")
 
 
-# Disable CLI web browsers
-term = os.environ.pop("TERM", None)
-# This import must be done with an empty $TERM, otherwise a command-line browser may be started
-# which will block the whole process - see https://docs.python.org/3/library/webbrowser.html
-import webbrowser
-
-if term:
-    os.environ["TERM"] = term
-
-try:
-    import json
-except ImportError:
-    import simplejson as json
+def is_chromeos_garcon():
+    """ Return whether we are running in Chrome OS and the browser can't see local files """
+    # In Crostini Chrome OS Linux, the default browser opens URLs in Chrome
+    # running outside the linux VM. This browser does not have access to the
+    # Linux filesystem. This uses Garcon, see for example
+    # https://chromium.googlesource.com/chromiumos/platform2/+/master/vm_tools/garcon/#opening-urls
+    # https://source.chromium.org/search?q=garcon-url-handler
+    return "garcon-url-handler" in webbrowser.get().name
 
 
 def run_fish_cmd(text):
@@ -885,7 +902,8 @@ class FishConfigHTTPRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
                 "quote",
                 "redirection",
                 "valid_path",
-                "autosuggestion" "user",
+                "autosuggestion",
+                "user",
                 "host",
                 "cancel",
             ]
@@ -973,6 +991,9 @@ class FishConfigHTTPRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
         for name in self.do_get_variable_names("set -nxL"):
             if name in vars:
                 vars[name].exported = True
+
+        # Do not return history as a variable, it may be so large the browser hangs.
+        vars.pop("history", None)
 
         return [
             vars[key].get_json_obj()
@@ -1315,18 +1336,30 @@ class FishConfigHTTPRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
             return self.send_error(403)
         self.path = p
 
-        ctype, pdict = cgi.parse_header(self.headers["content-type"])
+        # This is cheesy, we want just the actual content-type.
+        # In some cases it'll give us the encoding as well,
+        # ("application/json;charset=utf-8")
+        # but we don't currently care.
+        ctype = self.headers["content-type"].split(";")[0]
 
-        if ctype == "multipart/form-data":
-            postvars = cgi.parse_multipart(self.rfile, pdict)
-        elif ctype == "application/x-www-form-urlencoded":
+        if ctype == "application/x-www-form-urlencoded":
             length = int(self.headers["content-length"])
             url_str = self.rfile.read(length).decode("utf-8")
             postvars = parse_qs(url_str, keep_blank_values=1)
         elif ctype == "application/json":
             length = int(self.headers["content-length"])
-            url_str = self.rfile.read(length).decode(pdict["charset"])
+            # This used to use the provided encoding, but we use utf-8
+            # all around the place and nobody has ever complained.
+            #
+            # If any other encoding is received this will raise a UnicodeError,
+            # which will throw us out of the function and should at most exit webconfig.
+            # If that happens to anyone we expect bug reports.
+            url_str = self.rfile.read(length).decode("utf-8")
             postvars = json.loads(url_str)
+        elif ctype == "multipart/form-data":
+            # This used to be a thing, as far as I could find there's
+            # no use anymore, but let's keep an error around just in case.
+            return self.send_error(500)
         else:
             postvars = {}
 
@@ -1519,9 +1552,16 @@ def runThing():
     if isMacOS10_12_5_OrLater():
         subprocess.check_call(["open", fileurl])
     elif is_wsl():
-        subprocess.call(["cmd.exe", "/c", "start %s" % url])
+        cmd_path = find_executable("cmd.exe", COMMON_WSL_CMD_PATHS)
+        if cmd_path:
+            subprocess.call([cmd_path, "/c", "start %s" % url])
+        else:
+            print("Please add the directory containing cmd.exe to your $PATH")
+            sys.exit(-1)
     elif is_termux():
         subprocess.call(["termux-open-url", url])
+    elif is_chromeos_garcon():
+        webbrowser.open(url)
     else:
         webbrowser.open(fileurl)
 

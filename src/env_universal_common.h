@@ -11,6 +11,7 @@
 
 #include "common.h"
 #include "env.h"
+#include "fds.h"
 #include "wutil.h"
 
 /// Callback data, reflecting a change in universal variables.
@@ -164,9 +165,6 @@ class universal_notifier_t {
 
         // Mac-specific notify(3) implementation.
         strategy_notifyd,
-
-        // Set up a fifo and then waits for SIGIO to be delivered on it.
-        strategy_sigio,
 
         // Strategy that uses a named pipe. Somewhat complex, but portable and doesn't require
         // polling most of the time.

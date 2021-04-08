@@ -271,8 +271,12 @@ void process_t::check_generations_before_launch() {
 }
 
 void process_t::mark_aborted_before_launch() {
-    completed = true;
-    status = proc_status_t::from_exit_code(EXIT_FAILURE);
+    this->completed = true;
+    // The status may have already been set to e.g. STATUS_NOT_EXECUTABLE.
+    // Only stomp a successful status.
+    if (this->status.is_success()) {
+        this->status = proc_status_t::from_exit_code(EXIT_FAILURE);
+    }
 }
 
 bool process_t::is_internal() const {
@@ -333,7 +337,7 @@ bool job_t::has_external_proc() const {
 /// we exit. Poll these from time-to-time to prevent zombie processes from happening (#5342).
 static owning_lock<std::vector<pid_t>> s_disowned_pids;
 
-void add_disowned_job(job_t *j) {
+void add_disowned_job(const job_t *j) {
     if (j == nullptr) return;
 
     // Never add our own (or an invalid) pgid as it is not unique to only
@@ -649,13 +653,17 @@ static bool process_clean_after_marking(parser_t &parser, bool allow_interactive
             printed = true;
         }
 
-        // Prepare events for completed jobs, except for jobs that themselves came from event
-        // handlers.
-        if (!j->from_event_handler() && j->is_completed()) {
-            if (j->should_report_process_exits()) {
+        // Prepare events for completed jobs
+        if (j->is_completed()) {
+            // If this job already came from an event handler,
+            // don't create an event or it's easy to get an infinite loop.
+            if (!j->from_event_handler() && j->should_report_process_exits()) {
                 pid_t pgid = *j->get_pgid();
                 exit_events.push_back(proc_create_event(L"JOB_EXIT", event_type_t::exit, -pgid, 0));
             }
+            // Caller exit events we still create, which anecdotally fixes `source (thing | psub)` inside event handlers.
+            // This seems benign since this event is barely used (basically only psub), and it seems hard
+            // to construct an infinite loop with it.
             exit_events.push_back(
                 proc_create_event(L"JOB_EXIT", event_type_t::caller_exit, j->job_id(), 0));
             exit_events.back().desc.param1.caller_id = j->internal_job_id;

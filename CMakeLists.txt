@@ -39,17 +39,13 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdiagnostics-color=always")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fdiagnostics-color=always")
 endif()
+
 # Enable a whole bunch of warnings, but turn off:
-# - implicit fallthrough because that does not recognize some cases where it's desired (and I *really* want this one!)
 # - comment because we use a bunch of those, and they're not really all that harmful.
 # - address, because that occurs for our mkostemp check (weak-linking requires us to compare `&mkostemp == nullptr`).
-# - strict-aliasing, because on old GCCs (*Travis*) those are triggered by maybe.h, so you get it every time it is included.
-# - redundant-move, because we have one that is required on old libc
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra \
--Wno-implicit-fallthrough \
 -Wno-comment \
 -Wno-address \
--Wno-strict-aliasing \
 ")
 
 # Disable exception handling.
@@ -127,7 +123,7 @@ set(FISH_SRCS
     src/proc.cpp src/reader.cpp src/redirection.cpp src/sanity.cpp src/screen.cpp
     src/signal.cpp src/termsize.cpp src/timer.cpp src/tinyexpr.cpp
     src/tokenizer.cpp src/topic_monitor.cpp src/trace.cpp src/utf8.cpp src/util.cpp
-    src/wcstringutil.cpp src/wgetopt.cpp src/wildcard.cpp src/wutil.cpp
+    src/wcstringutil.cpp src/wgetopt.cpp src/wildcard.cpp src/wutil.cpp src/fds.cpp
 )
 
 # Header files are just globbed.

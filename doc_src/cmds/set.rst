@@ -49,7 +49,7 @@ The following options are available:
 
 - ``-e`` or ``--erase`` causes the specified shell variables to be erased
 
-- ``-q`` or ``--query`` test if the specified variable names are defined. Does not output anything, but the builtins exit status is the number of variables specified that were not defined.
+- ``-q`` or ``--query`` test if the specified variable names are defined. Does not output anything, but the builtins exit status is the number of variables specified that were not defined, or 255 if more than 255 variables are not defined.
 
 - ``-n`` or ``--names`` List only the names of all defined variables, not their value. The names are guaranteed to be sorted.
 
@@ -135,7 +135,7 @@ Examples
     set foo banana (false)
     echo $status # prints 1, because of the "(false)" above.
     
-    # Like other shells, fish 3.1 supports this syntax for passing a variable to just one command:
+    # Like other shells, pass a variable to just one command:
     # Run fish with a temporary home directory.
     HOME=(mktemp -d) fish
     # Which is essentially the same as:

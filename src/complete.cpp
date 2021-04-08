@@ -196,7 +196,7 @@ static complete_flags_t resolve_auto_space(const wcstring &comp, complete_flags_
     if (flags & COMPLETE_AUTO_SPACE) {
         new_flags &= ~COMPLETE_AUTO_SPACE;
         size_t len = comp.size();
-        if (len > 0 && (std::wcschr(L"/=@:.,", comp.at(len - 1)) != nullptr))
+        if (len > 0 && (std::wcschr(L"/=@:.,-", comp.at(len - 1)) != nullptr))
             new_flags |= COMPLETE_NO_SPACE;
     }
     return new_flags;
@@ -451,7 +451,7 @@ class completer_t {
 
    public:
     completer_t(const operation_context_t &ctx, completion_request_flags_t f)
-        : ctx(ctx), flags(f) {}
+        : ctx(ctx), flags(f), completions(ctx.expansion_limit) {}
 
     void perform_for_commandline(wcstring cmdline);
 
@@ -713,14 +713,7 @@ void completer_t::complete_cmd_desc(const wcstring &str) {
 /// Returns a description for the specified function, or an empty string if none.
 static wcstring complete_function_desc(const wcstring &fn) {
     wcstring result;
-    bool has_description = function_get_desc(fn, result);
-    if (!has_description) {
-        function_get_definition(fn, result);
-        // A completion description is a single line.
-        for (wchar_t &c : result) {
-            if (c == L'\n') c = L' ';
-        }
-    }
+    function_get_desc(fn, result);
     return result;
 }
 
@@ -1252,8 +1245,8 @@ bool completer_t::complete_variable(const wcstring &str, size_t start_offset) {
                 // $history can be huge, don't put all of it in the completion description; see
                 // #6288.
                 if (env_name == L"history") {
-                    history_t *history =
-                        &history_t::history_with_name(history_session_id(ctx.vars));
+                    std::shared_ptr<history_t> history =
+                        history_t::with_name(history_session_id(ctx.vars));
                     for (size_t i = 1; i < history->size() && desc.size() < 64; i++) {
                         if (i > 1) desc += L' ';
                         desc += expand_escape_string(history->item_at_index(i).str());
@@ -1743,7 +1736,8 @@ void completer_t::perform_for_commandline(wcstring cmdline) {
         }
 
         // Hack. If we're cd, handle it specially (issue #1059, others).
-        handle_as_special_cd = (unesc_command == L"cd");
+        handle_as_special_cd =
+            (unesc_command == L"cd") || arg_data.visited_wrapped_commands.count(L"cd");
     }
 
     // Maybe apply variable assignments.

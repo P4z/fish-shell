@@ -40,12 +40,13 @@ static const struct woption long_options[] = {{L"help", no_argument, nullptr, 'h
                                               {L"path", no_argument, nullptr, 'p'},
                                               {L"force-path", no_argument, nullptr, 'P'},
                                               {L"query", no_argument, nullptr, 'q'},
+                                              {L"quiet", no_argument, nullptr, 'q'},
                                               {nullptr, 0, nullptr, 0}};
 
-static int parse_cmd_opts(type_cmd_opts_t &opts, int *optind, int argc, wchar_t **argv,
+static int parse_cmd_opts(type_cmd_opts_t &opts, int *optind, int argc, const wchar_t **argv,
                           parser_t &parser, io_streams_t &streams) {
     UNUSED(parser);
-    wchar_t *cmd = argv[0];
+    const wchar_t *cmd = argv[0];
     int opt;
     wgetopter_t w;
     while ((opt = w.wgetopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
@@ -101,7 +102,7 @@ static int parse_cmd_opts(type_cmd_opts_t &opts, int *optind, int argc, wchar_t 
 }
 
 /// Implementation of the builtin 'type'.
-maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
+maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, const wchar_t **argv) {
     UNUSED(parser);
     const wchar_t *cmd = argv[0];
     int argc = builtin_count_args(argv);
@@ -132,7 +133,6 @@ maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, wchar_t **arg
             ++found;
             res = true;
             if (!opts.query && !opts.type) {
-                streams.out.append_format(_(L"%ls is a function"), name);
                 auto path = function_get_definition_file(name);
                 if (opts.path) {
                     if (path) {
@@ -140,6 +140,7 @@ maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, wchar_t **arg
                         streams.out.append(L"\n");
                     }
                 } else if (!opts.short_output) {
+                    streams.out.append_format(_(L"%ls is a function"), name);
                     streams.out.append(_(L" with definition"));
                     streams.out.append(L"\n");
                     // Function path
@@ -155,7 +156,7 @@ maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, wchar_t **arg
                         def = comment.append(def);
                     } else {
                         wcstring comment;
-                        append_format(comment, L"# Defined interactively");
+                        append_format(comment, L"# Defined interactively\n");
                         def = comment.append(def);
                     }
                     if (!streams.out_is_redirected && isatty(STDOUT_FILENO)) {
@@ -166,6 +167,7 @@ maybe_t<int> builtin_type(parser_t &parser, io_streams_t &streams, wchar_t **arg
                         streams.out.append(def);
                     }
                 } else {
+                    streams.out.append_format(_(L"%ls is a function"), name);
                     auto path = function_get_definition_file(name);
                     if (path) {
                         streams.out.append_format(_(L" (defined in %ls)"), path);

@@ -40,10 +40,11 @@ struct functions_cmd_opts_t {
     bool query = false;
     bool copy = false;
     bool report_metadata = false;
+    bool no_metadata = false;
     bool verbose = false;
     bool handlers = false;
-    wchar_t *handlers_type = nullptr;
-    wchar_t *description = nullptr;
+    const wchar_t *handlers_type = nullptr;
+    const wchar_t *description = nullptr;
 };
 static const wchar_t *const short_options = L":Ht:Dacd:ehnqv";
 static const struct woption long_options[] = {{L"erase", no_argument, nullptr, 'e'},
@@ -54,14 +55,15 @@ static const struct woption long_options[] = {{L"erase", no_argument, nullptr, '
                                               {L"query", no_argument, nullptr, 'q'},
                                               {L"copy", no_argument, nullptr, 'c'},
                                               {L"details", no_argument, nullptr, 'D'},
+                                              {L"no-details", no_argument, nullptr, 1},
                                               {L"verbose", no_argument, nullptr, 'v'},
                                               {L"handlers", no_argument, nullptr, 'H'},
                                               {L"handlers-type", required_argument, nullptr, 't'},
                                               {nullptr, 0, nullptr, 0}};
 
 static int parse_cmd_opts(functions_cmd_opts_t &opts, int *optind,  //!OCLINT(high ncss method)
-                          int argc, wchar_t **argv, parser_t &parser, io_streams_t &streams) {
-    wchar_t *cmd = argv[0];
+                          int argc, const wchar_t **argv, parser_t &parser, io_streams_t &streams) {
+    const wchar_t *cmd = argv[0];
     int opt;
     wgetopter_t w;
     while ((opt = w.wgetopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
@@ -76,6 +78,10 @@ static int parse_cmd_opts(functions_cmd_opts_t &opts, int *optind,  //!OCLINT(hi
             }
             case 'D': {
                 opts.report_metadata = true;
+                break;
+            }
+            case 1: {
+                opts.no_metadata = true;
                 break;
             }
             case 'd': {
@@ -184,7 +190,7 @@ static int report_function_metadata(const wchar_t *funcname, bool verbose, io_st
 }
 
 /// The functions builtin, used for listing and erasing functions.
-maybe_t<int> builtin_functions(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
+maybe_t<int> builtin_functions(parser_t &parser, io_streams_t &streams, const wchar_t **argv) {
     const wchar_t *cmd = argv[0];
     int argc = builtin_count_args(argv);
     functions_cmd_opts_t opts;
@@ -206,21 +212,25 @@ maybe_t<int> builtin_functions(parser_t &parser, io_streams_t &streams, wchar_t 
         return STATUS_INVALID_ARGS;
     }
 
+    if (opts.report_metadata && opts.no_metadata) {
+        streams.err.append_format(BUILTIN_ERR_COMBO, cmd);
+        builtin_print_error_trailer(parser, streams.err, cmd);
+        return STATUS_INVALID_ARGS;
+    }
+
     if (opts.erase) {
         for (int i = optind; i < argc; i++) function_remove(argv[i]);
         return STATUS_CMD_OK;
     }
 
     if (opts.description) {
-        wchar_t *func;
-
         if (argc - optind != 1) {
             streams.err.append_format(_(L"%ls: Expected exactly one function name\n"), cmd);
             builtin_print_error_trailer(parser, streams.err, cmd);
             return STATUS_INVALID_ARGS;
         }
 
-        func = argv[optind];
+        const wchar_t *func = argv[optind];
         if (!function_exists(func, parser)) {
             streams.err.append_format(_(L"%ls: Function '%ls' does not exist\n"), cmd, func);
             builtin_print_error_trailer(parser, streams.err, cmd);
@@ -337,7 +347,9 @@ maybe_t<int> builtin_functions(parser_t &parser, io_streams_t &streams, wchar_t 
             if (!opts.query) {
                 if (i != optind) streams.out.append(L"\n");
                 const wchar_t *funcname = argv[i];
-                report_function_metadata(funcname, opts.verbose, streams, parser, true);
+                if (!opts.no_metadata) {
+                    report_function_metadata(funcname, opts.verbose, streams, parser, true);
+                }
                 wcstring def = functions_def(funcname);
 
                 if (!streams.out_is_redirected && isatty(STDOUT_FILENO)) {

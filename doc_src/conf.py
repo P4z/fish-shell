@@ -52,12 +52,6 @@ def setup(app):
     )
     lexers["fish-docs-samples"] = fish_indent_lexer
 
-    # add_css_file only appears in Sphinx 1.8.0
-    if hasattr(app, "add_css_file"):
-        app.add_css_file("custom.css")
-    else:
-        app.add_stylesheet("custom.css")
-
     app.add_config_value("issue_url", default=None, rebuild="html")
     app.add_role("issue", issue_role)
 
@@ -141,8 +135,9 @@ pygments_style = None
 # of _static/pygments.css
 html_theme_path = ["."]
 html_theme = "python_docs_theme"
-# html_theme_path = ["./cloud_sptheme/themes"]
-# html_theme = "cloud"
+
+# Don't add a weird "_sources" directory
+html_copy_source = False
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
@@ -153,7 +148,7 @@ html_theme = "python_docs_theme"
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ["_static"]
+# html_static_path = ["_static"]
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.
@@ -221,7 +216,9 @@ def get_command_description(path, name):
 man_pages = [
     (master_doc, "fish-doc", "fish-shell Documentation", [author], 1),
     ("tutorial", "fish-tutorial", "fish-shell tutorial", [author], 1),
-    ("CHANGELOG", "fish-changelog", "fish-shell changelog", [author], 1),
+    ("language", "fish-language", "The fish language", [author], 1),
+    ("interactive", "fish-interactive", "Using fish interactively", [author], 1),
+    ("relnotes", "fish-releasenotes", "fish-shell release notes", [author], 1),
     ("completions", "fish-completions", "Writing fish completions", [author], 1),
     (
         "fish_for_bash_users",

@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fallback.h"  // IWYU pragma: keep
 #include "io.h"
+#include "wcstringutil.h"
 #include "wgetopt.h"
 #include "wutil.h"  // IWYU pragma: keep
 
@@ -26,7 +27,7 @@ static const struct woption long_options[] = {{L"no-symlinks", no_argument, null
                                               {nullptr, 0, nullptr, 0}};
 
 static int parse_cmd_opts(realpath_cmd_opts_t &opts, int *optind,  //!OCLINT(high ncss method)
-                          int argc, wchar_t **argv, parser_t &parser, io_streams_t &streams) {
+                          int argc, const wchar_t **argv, parser_t &parser, io_streams_t &streams) {
     const wchar_t *cmd = argv[0];
     int opt;
     wgetopter_t w;
@@ -60,7 +61,7 @@ static int parse_cmd_opts(realpath_cmd_opts_t &opts, int *optind,  //!OCLINT(hig
 /// An implementation of the external realpath command. Doesn't support any options.
 /// In general scripts shouldn't invoke this directly. They should just use `realpath` which
 /// will fallback to this builtin if an external command cannot be found.
-maybe_t<int> builtin_realpath(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
+maybe_t<int> builtin_realpath(parser_t &parser, io_streams_t &streams, const wchar_t **argv) {
     const wchar_t *cmd = argv[0];
     realpath_cmd_opts_t opts;
     int argc = builtin_count_args(argv);
@@ -80,25 +81,27 @@ maybe_t<int> builtin_realpath(parser_t &parser, io_streams_t &streams, wchar_t *
         return STATUS_INVALID_ARGS;
     }
 
+    const wchar_t *arg = argv[optind];
+
     if (!opts.no_symlinks) {
-        if (auto real_path = wrealpath(argv[optind])) {
+        if (auto real_path = wrealpath(arg)) {
             streams.out.append(*real_path);
         } else {
             if (errno) {
                 // realpath() just couldn't do it. Report the error and make it clear
                 // this is an error from our builtin, not the system's realpath.
-                streams.err.append_format(L"builtin %ls: %ls: %s\n", cmd, argv[optind],
+                streams.err.append_format(L"builtin %ls: %ls: %s\n", cmd, arg,
                                           std::strerror(errno));
             } else {
                 // Who knows. Probably a bug in our wrealpath() implementation.
-                streams.err.append_format(_(L"builtin %ls: Invalid path: %ls\n"), cmd,
-                                          argv[optind]);
+                streams.err.append_format(_(L"builtin %ls: Invalid arg: %ls\n"), cmd, arg);
             }
 
             return STATUS_CMD_ERROR;
         }
     } else {
-        streams.out.append(normalize_path(argv[optind], /* allow leading double slashes */ false));
+        wcstring absolute_arg = string_prefixes_string(L"/", arg) ? arg : wgetcwd() + L"/" + arg;
+        streams.out.append(normalize_path(absolute_arg, /* allow leading double slashes */ false));
     }
 
     streams.out.append(L"\n");
